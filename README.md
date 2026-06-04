@@ -68,6 +68,8 @@ pinepi-waveshare-epaper213/
 
 Tap anywhere on screen to cycle through pages in single direction.
 
+> **⚠️ Operation Tip:** E-ink displays have very slow refresh speeds. Please wait patiently after page turns, restarts or other operations; waiting times can sometimes last several minutes.
+
 ---
 
 ## Installation
@@ -153,12 +155,13 @@ Set the `wss_url` and `auth_token` in the device config to match your deployed s
 
 ---
 
-## License
-
-MIT (C driver library follows Waveshare original license)
 
 ## Waveshare 2.13inch E-Paper HAT Documentation
 
 For detailed documentation on the Waveshare 2.13inch E-Paper HAT, please refer to the official documentation:
 
 - [Waveshare 2.13inch E-Paper HAT Product Page](https://www.waveshare.com/wiki/2.13inch_e-Paper_HAT)
+
+## License
+
+MIT (C driver library follows Waveshare original license)
