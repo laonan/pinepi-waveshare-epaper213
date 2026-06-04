@@ -70,68 +70,20 @@ Tap anywhere on screen to cycle through pages in single direction.
 
 ---
 
-## Local Development
-
-### 1. Compile C Program
-
-```bash
-cd c
-make clean && make
-```
-
-Output: `c/pinepi`, the display driver binary. When deploying to Zero W / WH / Zero 2 W, please compile on **Raspberry Pi OS Lite (32-bit)** or use ARMv6-compatible 32-bit cross-compilation output.
-
-> Note: `install.sh` will prioritize copying existing `c/pinepi` from current directory to `/opt/pinepi-waveshare-epaper213/bin/pinepi-waveshare-epaper213`. You must recompile after modifying `c/src/main.c`, otherwise the old binary will still be deployed.
-
-> Requires Raspberry Pi environment with `liblgpio-dev` installed.
-
-### 2. Python Virtual Environment
-
-```bash
-cd python
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 3. Local Run (No Raspberry Pi hardware needed, for logic testing)
-
-```bash
-# Test Python logic only (WSS, Web, rendering)
-python main.py
-```
-
-To debug without hardware environment, point `DISPLAY_BIN` to a mock script:
-```bash
-export PINEPI_DISPLAY=/path/to/mock_display
-export PINEPI_CONFIG=./config.json
-python python/main.py
-```
-
----
-
 ## Installation
 
 Execute on **Raspberry Pi OS Lite (32-bit)**:
 
 ### Local Installation (Recommended)
 
-Clone/download the complete source and run:
+Clone the repository and run the installer:
 
 ```bash
-# Optional: compile C driver if needed
-cd c && make clean && make && cd ..
-
-# Install
-sudo bash install.sh
-```
-
-### Remote Installation (Optional)
-
-If you have deployed the release artifacts to a CDN:
-
-```bash
-export PINEPI_RELEASE_URL=https://your-cdn.example.com/pinepi/release
+git clone https://github.com/laonan/pinepi-waveshare-epaper213.git
+cd pinepi-waveshare-epaper213
+cd c
+make clean && make
+cd ..
 sudo bash install.sh
 ```
 
