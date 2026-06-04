@@ -2,6 +2,8 @@
 
 A cloud/local hybrid dashboard based on Raspberry Pi Zero + Waveshare 2.13 inch e-Paper display (V3).
 
+![Display Effect](examples/display-effect.jpg)
+
 ---
 
 ## Project Structure
