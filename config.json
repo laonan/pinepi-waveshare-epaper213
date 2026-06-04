@@ -1,0 +1,12 @@
+{
+  "wifi_networks": [
+    {
+      "ssid": "",
+      "password": ""
+    }
+  ],
+  "wss_url": "wss://your-server.com/ws",
+  "auth_token": "",
+  "ap_ssid": "PinePi-Config",
+  "ap_password": "12345678"
+}

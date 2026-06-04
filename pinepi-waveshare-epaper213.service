@@ -1,0 +1,24 @@
+[Unit]
+Description=PinePi Core & Display Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pinepi-waveshare-epaper213
+
+Environment=PINEPI_CONFIG=/etc/pinepi-waveshare-epaper213/config.json
+Environment=PINEPI_DISPLAY=/opt/pinepi-waveshare-epaper213/bin/pinepi-waveshare-epaper213
+Environment=PYTHONUNBUFFERED=1
+
+# Clean up stale socket files before starting
+ExecStartPre=/bin/sh -c 'rm -f /tmp/pinepi.sock /tmp/pinepi-touch.sock 2>/dev/null || true'
+
+ExecStart=/opt/pinepi-waveshare-epaper213/venv/bin/python -u /opt/pinepi-waveshare-epaper213/core/main.py
+
+Restart=always
+RestartSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

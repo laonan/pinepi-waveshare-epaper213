@@ -1,0 +1,5 @@
+websockets>=12.0
+pillow>=10.0
+qrcode>=7.4
+psutil>=5.9
+flask>=3.0
