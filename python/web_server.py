@@ -217,6 +217,44 @@ class WebServer:
                 mtype="ok",
             )
 
+        # ------------------------------------------------------------------
+        # Captive Portal Detection Routes (Auto-redirect to config page)
+        # ------------------------------------------------------------------
+
+        @app.route("/generate_204")  # Android
+        @app.route("/generate204")   # Android variants
+        def captive_android():
+            """Return 204 No Content to trigger captive portal popup"""
+            return "", 204
+
+        @app.route("/hotspot-detect.html")  # Apple iOS/macOS
+        @app.route("/library/test/success.html")  # Apple fallback
+        def captive_apple():
+            """Return success page that redirects to config portal"""
+            return """<!DOCTYPE html>
+<html><head><title>Success</title>
+<meta http-equiv="refresh" content="0; url=http://10.42.0.1:8080/">
+</head><body>Redirecting to PinePi Config...</body></html>""", 200
+
+        @app.route("/connecttest.txt")  # Windows
+        @app.route("/ncsi.txt")         # Windows NCSI
+        def captive_windows():
+            """Return Microsoft Connect Test success with redirect"""
+            return "Microsoft Connect Test", 200
+
+        @app.route("/redirect")  # Generic captive portal redirect
+        def captive_redirect():
+            """Direct redirect to config page"""
+            return render_template_string("""
+<!doctype html>
+<html><head>
+<meta http-equiv="refresh" content="0; url=http://10.42.0.1:8080/">
+<title>Redirecting...</title>
+</head><body>
+<p>Redirecting to <a href="http://10.42.0.1:8080/">PinePi Configuration</a>...</p>
+</body></html>
+""")
+
         return app
 
     def run(self):

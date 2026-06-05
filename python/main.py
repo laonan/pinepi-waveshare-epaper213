@@ -132,6 +132,8 @@ async def network_loop(config, network_manager, state_machine, display, renderer
     """Background coroutine: check network status periodically, auto-switch to AP when no usable LAN IP, ensure Station mode when LAN IP available"""
     ap_active = False
     last_mode = None  # "lan" | "ap" | None
+    last_wifi_reconnect_attempt = 0  # Track last reconnection attempt time
+    WIFI_RECONNECT_INTERVAL = 60  # Seconds between reconnection attempts
 
     while True:
         # Get unified network state
@@ -153,6 +155,26 @@ async def network_loop(config, network_manager, state_machine, display, renderer
         # AP should be active when there's no usable LAN IP
         should_ap_be_active = not has_lan_ip
 
+        # When in AP mode, periodically try to reconnect to configured Wi-Fi
+        # This handles recovery from unexpected network dropouts
+        if ap_active and not has_lan_ip:
+            current_time = time.time()
+            if current_time - last_wifi_reconnect_attempt >= WIFI_RECONNECT_INTERVAL:
+                if config.wifi_networks:
+                    print("[NetworkLoop] In AP mode, attempting Wi-Fi reconnection...")
+                    reconnected = network_manager.ensure_best_wifi(config.wifi_networks)
+                    if reconnected:
+                        print("[NetworkLoop] Wi-Fi reconnected! Will stop AP on next check.")
+                        # Refresh state to get new LAN IP
+                        net_state = network_manager.get_network_state()
+                        has_lan_ip = net_state["lan_ip"] is not None
+                    else:
+                        print("[NetworkLoop] Wi-Fi reconnection failed, staying in AP mode")
+                    last_wifi_reconnect_attempt = current_time
+                else:
+                    # No Wi-Fi networks configured, don't retry
+                    last_wifi_reconnect_attempt = current_time
+
         if should_ap_be_active and not ap_active:
             print("[NetworkLoop] No usable LAN IP -> starting AP mode")
             ap_started = network_manager.create_ap()
@@ -168,8 +190,8 @@ async def network_loop(config, network_manager, state_machine, display, renderer
             else:
                 print("[NetworkLoop] AP mode failed to start, will retry")
 
-            # Refresh Page 3 if needed
-            if state_machine.current_page == 3:
+            # Refresh Page 3 if needed (skip if display is busy from user interaction)
+            if state_machine.current_page == 3 and display.can_refresh:
                 img = renderer.render_page3_with_state(net_state)
                 display.send(img)
 
@@ -182,15 +204,15 @@ async def network_loop(config, network_manager, state_machine, display, renderer
             else:
                 print("[NetworkLoop] AP stop failed, will retry")
 
-            # Refresh Page 3 if needed
-            if state_machine.current_page == 3:
+            # Refresh Page 3 if needed (skip if display is busy from user interaction)
+            if state_machine.current_page == 3 and display.can_refresh:
                 img = renderer.render_page3_with_state(net_state)
                 display.send(img)
 
         # If Page 3 is active, refresh periodically to show current state
         # (for when AP is still starting or user just connected to Wi-Fi)
-        if state_machine.current_page == 3:
-            # Refresh to show updated state
+        # Skip if display is currently busy (user may be turning pages)
+        if state_machine.current_page == 3 and display.can_refresh:
             img = renderer.render_page3_with_state(net_state)
             display.send(img)
 

@@ -70,8 +70,7 @@ pinepi-waveshare-epaper213/
 
 Tap anywhere on screen to cycle through pages in single direction.
 
-> **⚠️ Operation Tip:** E-ink displays have very slow refresh speeds. Please wait patiently after page turns, restarts or other operations; waiting times can sometimes last several minutes.
-
+> **⚠️ Operation Tip:** E-ink displays have very slow refresh speeds. Please wait patiently after page turns, restarts or other operations; waiting times can sometimes last several minutes (such as after a power cycle or system reboot).
 ---
 
 ## Installation
