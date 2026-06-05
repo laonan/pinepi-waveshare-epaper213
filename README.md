@@ -146,7 +146,17 @@ Set the `wss_url` and `auth_token` in the device config to match your deployed s
 
 ---
 
-## Key Design Decisions
+## Wi-Fi Notes
+
+If you plan to keep the device powered on for extended periods, run the command below. The Wi-Fi on the Raspberry Pi Zero is prone to unstable connections.
+
+```bash
+sudo iw dev wlan0 set power_save off
+```
+
+---
+
+## Key Design Decisionsi
 
 1. **C Process Crash Auto-Restart**: Python built-in watchdog, `poll()` detects C process status, auto-spawns new process within 2 seconds.
 2. **GT_Scan Thread Safety**: All touch scans execute only in main thread; UDS receive thread only delivers refresh flags, avoiding race on `Dev_Now`.
