@@ -79,7 +79,22 @@ Execute on **Raspberry Pi OS Lite (32-bit)**:
 
 ### Local Installation (Recommended)
 
-Clone the repository and run the installer:
+First, Enable SPI and I2C interfaces:
+
+```bash
+sudo raspi-config
+# Navigate to Interfacing Options -> SPI -> Enable in sequence
+# Navigate to Interfacing Options -> I2C -> Enable in sequence
+```
+
+Then install the required dependencies:
+
+```bash
+sudo apt update
+sudo apt install liblgpio-dev
+```
+
+Then clone the repository and run the installer:
 
 ```bash
 git clone https://github.com/laonan/pinepi-waveshare-epaper213.git
