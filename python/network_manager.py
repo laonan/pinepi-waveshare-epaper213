@@ -182,8 +182,47 @@ class NetworkManager:
         except Exception:
             return ""
 
+    def get_current_wifi_ssid(self) -> Optional[str]:
+        """Get currently connected Wi-Fi SSID"""
+        try:
+            result = subprocess.run(
+                ["nmcli", "-t", "-f", "ACTIVE,SSID", "device", "wifi", "list"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if line.startswith('yes:'):
+                        return line.split(':')[1] if ':' in line else None
+            return None
+        except Exception:
+            return None
+
+    def disconnect_wifi(self) -> bool:
+        """Disconnect from current Wi-Fi"""
+        try:
+            subprocess.run(
+                ["nmcli", "device", "disconnect", "wlan0"],
+                check=True, stderr=subprocess.DEVNULL, timeout=10
+            )
+            print("[NetworkManager] Disconnected from current Wi-Fi")
+            return True
+        except Exception:
+            return False
+
     def connect_wifi(self, ssid: str, password: str) -> bool:
-        """Connect to specified Wi-Fi, update password if connection exists"""
+        """Connect to specified Wi-Fi, update password if connection exists.
+        Disconnects from current Wi-Fi first to ensure clean switch."""
+        # Check if already connected to requested SSID
+        current_ssid = self.get_current_wifi_ssid()
+        if current_ssid == ssid:
+            print(f"[NetworkManager] Already connected to {ssid}")
+            return True
+
+        # Disconnect from current Wi-Fi first to ensure clean switch
+        if current_ssid:
+            self.disconnect_wifi()
+            time.sleep(1)  # Wait for disconnect to complete
+
         # Check if connection profile exists
         try:
             result = subprocess.run(
@@ -206,15 +245,15 @@ class NetworkManager:
             except Exception as e:
                 print(f"[NetworkManager] Failed to update password for {ssid}: {e}")
 
-            # Try to activate the connection
+            # Activate the connection
             try:
                 subprocess.run(
                     ["nmcli", "connection", "up", ssid],
                     check=True, stderr=subprocess.DEVNULL, timeout=15
                 )
                 return True
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[NetworkManager] Failed to activate {ssid}: {e}")
 
         # Create new connection or re-scan and connect
         try:
@@ -298,9 +337,39 @@ class NetworkManager:
             print(f"[NetworkManager] AP stop failed with exception: {e}")
             return False
 
+    def is_wifi_associated(self) -> bool:
+        """Check if Wi-Fi is associated with any SSID (netplan-compatible check using iw)"""
+        try:
+            result = subprocess.run(
+                ["iw", "dev", "wlan0", "link"],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.returncode == 0 and "SSID:" in result.stdout
+        except Exception:
+            return False
+
     def ensure_best_wifi(self, networks: List[Dict[str, str]]) -> bool:
         """Try connecting to Wi-Fi networks in the configuration list sequentially.
-        Accepts connection if a usable LAN IP is obtained (not requiring full internet)."""
+        Accepts connection if a usable LAN IP is obtained (not requiring full internet).
+        
+        NETPLAN COMPATIBILITY: Avoids nmcli disconnections on working associations.
+        Uses iw for read-only checks, only uses nmcli when truly needed."""
+        # First, check if already associated with Wi-Fi (lightweight iw check)
+        if self.is_wifi_associated():
+            # Check if we have an IP
+            lan_ip = self.get_usable_lan_ip()
+            if lan_ip:
+                current_ssid = self.get_current_wifi_ssid()
+                print(f"[NetworkManager] Wi-Fi associated ({current_ssid or 'unknown'}), IP: {lan_ip}")
+                return True
+            
+            # Associated but no IP - likely DHCP issue, don't force reconnect
+            # Give DHCP more time instead of disrupting the association
+            print("[NetworkManager] Wi-Fi associated but no IP - waiting for DHCP, not reconnecting")
+            return False
+
+        # Not associated - try each configured network in order
+        print("[NetworkManager] Wi-Fi not associated, attempting connection...")
         for net in networks:
             ssid = net.get("ssid", "").strip()
             pwd = net.get("password", "").strip()
@@ -309,8 +378,6 @@ class NetworkManager:
             print(f"[NetworkManager] Trying {ssid}...")
             if self.connect_wifi(ssid, pwd):
                 time.sleep(2)
-                # Check for usable LAN IP instead of full internet
-                # Device may be on Wi-Fi without external internet access
                 lan_ip = self.get_usable_lan_ip()
                 if lan_ip:
                     print(f"[NetworkManager] Connected to {ssid} (LAN IP: {lan_ip})")

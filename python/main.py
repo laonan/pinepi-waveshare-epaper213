@@ -129,11 +129,15 @@ async def keep_alive_loop(state, display, renderer, ws, network_manager):
 
 
 async def network_loop(config, network_manager, state_machine, display, renderer):
-    """Background coroutine: check network status periodically, auto-switch to AP when no usable LAN IP, ensure Station mode when LAN IP available"""
+    """Background coroutine: check network status periodically, auto-switch to AP when no usable LAN IP, ensure Station mode when LAN IP available.
+    Designed to be non-intrusive with netplan-managed connections."""
     ap_active = False
     last_mode = None  # "lan" | "ap" | None
     last_wifi_reconnect_attempt = 0  # Track last reconnection attempt time
-    WIFI_RECONNECT_INTERVAL = 60  # Seconds between reconnection attempts
+    WIFI_RECONNECT_INTERVAL = 300  # 5 minutes between reconnection attempts (was 60s, too aggressive)
+    lan_ip_missing_count = 0  # Track consecutive missing LAN IP checks
+    LAN_IP_MISSING_THRESHOLD = 3  # Require 3 consecutive failures (45 seconds) before triggering AP mode
+    grace_period_end = 0  # Grace period after reconnection to avoid flip-flopping
 
     while True:
         # Get unified network state
@@ -152,27 +156,49 @@ async def network_loop(config, network_manager, state_machine, display, renderer
             last_mode = mode
 
         # Decision: should AP be active?
-        # AP should be active when there's no usable LAN IP
-        should_ap_be_active = not has_lan_ip
+        # AP should be active when there's no usable LAN IP - but with debouncing
+        # to avoid triggering on transient DHCP renewal glitches
+        if has_lan_ip:
+            lan_ip_missing_count = 0  # Reset counter on successful detection
+            # If we recently reconnected, extend grace period
+            if time.time() < grace_period_end:
+                grace_period_end = time.time() + 30  # Extend grace period
+        else:
+            lan_ip_missing_count += 1
 
-        # When in AP mode, periodically try to reconnect to configured Wi-Fi
-        # This handles recovery from unexpected network dropouts
-        if ap_active and not has_lan_ip:
+        # Only trigger AP mode after sustained absence of LAN IP
+        # This prevents flip-flopping during DHCP renewals (~70 second outages observed)
+        should_ap_be_active = lan_ip_missing_count >= LAN_IP_MISSING_THRESHOLD
+
+        # When in grace period, don't attempt any reconnection (avoid nmcli interference with netplan)
+        in_grace_period = time.time() < grace_period_end
+
+        # When no LAN IP detected, try to reconnect - but only if grace period passed
+        if not has_lan_ip and not in_grace_period and lan_ip_missing_count >= LAN_IP_MISSING_THRESHOLD - 1:
             current_time = time.time()
             if current_time - last_wifi_reconnect_attempt >= WIFI_RECONNECT_INTERVAL:
                 if config.wifi_networks:
-                    print("[NetworkLoop] In AP mode, attempting Wi-Fi reconnection...")
-                    reconnected = network_manager.ensure_best_wifi(config.wifi_networks)
-                    if reconnected:
-                        print("[NetworkLoop] Wi-Fi reconnected! Will stop AP on next check.")
-                        # Refresh state to get new LAN IP
-                        net_state = network_manager.get_network_state()
-                        has_lan_ip = net_state["lan_ip"] is not None
+                    mode_str = "AP mode" if ap_active else "Station mode (no IP)"
+                    print(f"[NetworkLoop] In {mode_str}, attempting Wi-Fi reconnection...")
+                    print(f"[NetworkLoop] NOTE: Using non-intrusive method for netplan compatibility")
+                    # Use lightweight check first - don't disconnect if already associated
+                    current_ssid = network_manager.get_current_wifi_ssid()
+                    if current_ssid:
+                        print(f"[NetworkLoop] Already associated with {current_ssid}, waiting for DHCP...")
+                        # Give DHCP more time before attempting reconnection
+                        grace_period_end = time.time() + 60  # 60 second grace period
                     else:
-                        print("[NetworkLoop] Wi-Fi reconnection failed, staying in AP mode")
+                        reconnected = network_manager.ensure_best_wifi(config.wifi_networks)
+                        if reconnected:
+                            print("[NetworkLoop] Wi-Fi reconnected! 5-minute grace period starting.")
+                            grace_period_end = time.time() + 300  # 5-minute grace period
+                            net_state = network_manager.get_network_state()
+                            has_lan_ip = net_state["lan_ip"] is not None
+                            lan_ip_missing_count = 0
+                        else:
+                            print("[NetworkLoop] Wi-Fi reconnection failed, will retry in 5 minutes")
                     last_wifi_reconnect_attempt = current_time
                 else:
-                    # No Wi-Fi networks configured, don't retry
                     last_wifi_reconnect_attempt = current_time
 
         if should_ap_be_active and not ap_active:

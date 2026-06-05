@@ -1,4 +1,5 @@
 import subprocess
+import time
 from flask import Flask, request, render_template_string, jsonify
 from werkzeug.serving import make_server
 
@@ -161,7 +162,28 @@ class WebServer:
 
             # Try switching back to Station mode and connect
             self.nm.stop_ap()
-            ok = self.nm.ensure_best_wifi(networks)
+            time.sleep(1)  # Wait for AP to fully stop
+
+            # Check if we need to switch Wi-Fi networks
+            ok = False
+            if networks:
+                current_ssid = self.nm.get_current_wifi_ssid()
+                target_ssid = networks[0].get("ssid", "").strip()
+
+                if current_ssid == target_ssid:
+                    # Already on correct network, just verify connection
+                    print(f"[WebServer] Already connected to target SSID: {target_ssid}")
+                    ok = True
+                elif current_ssid:
+                    # Connected to wrong network - need to disconnect first
+                    print(f"[WebServer] Connected to {current_ssid}, need to switch to {target_ssid}")
+                    self.nm.disconnect_wifi()
+                    time.sleep(2)  # Wait for disconnect
+                    ok = self.nm.connect_wifi(target_ssid, networks[0].get("password", ""))
+                else:
+                    # Not connected, try to connect to primary network
+                    print(f"[WebServer] Not connected, attempting to connect to {target_ssid}")
+                    ok = self.nm.ensure_best_wifi(networks)
 
             # Restart service to apply WSS settings
             print("[WebServer] Restarting service to apply new configuration...")
