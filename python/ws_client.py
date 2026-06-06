@@ -52,6 +52,7 @@ class WSClient:
                     ping_interval=None,
                     ping_timeout=None,
                     close_timeout=5,
+                    open_timeout=10,  # Prevent hanging on connection when network is down
                 ) as ws:
                     # Authentication
                     await ws.send(self._auth_message())
@@ -78,8 +79,13 @@ class WSClient:
 
             except ConnectionClosed as e:
                 print(f"[WSClient] Connection closed: {e}, reconnecting in 5s...")
+            except asyncio.TimeoutError:
+                print("[WSClient] Connection timeout (network may be down), reconnecting in 5s...")
+            except OSError as e:
+                # Catch network errors like "Network is unreachable"
+                print(f"[WSClient] Network error: {e}, reconnecting in 5s...")
             except Exception as e:
-                print(f"[WSClient] Error: {e}, reconnecting in 5s...")
+                print(f"[WSClient] Error: {type(e).__name__}: {e}, reconnecting in 5s...")
 
             await asyncio.sleep(5)
 

@@ -348,32 +348,61 @@ class NetworkManager:
         except Exception:
             return False
 
+    def _is_ssid_in_networks(self, ssid: str, networks: List[Dict[str, str]]) -> bool:
+        """Check if given SSID is in the configured networks list"""
+        if not ssid:
+            return False
+        for net in networks:
+            if net.get("ssid", "").strip() == ssid:
+                return True
+        return False
+
     def ensure_best_wifi(self, networks: List[Dict[str, str]]) -> bool:
         """Try connecting to Wi-Fi networks in the configuration list sequentially.
         Accepts connection if a usable LAN IP is obtained (not requiring full internet).
         
         NETPLAN COMPATIBILITY: Avoids nmcli disconnections on working associations.
-        Uses iw for read-only checks, only uses nmcli when truly needed."""
+        Uses iw for read-only checks, only uses nmcli when truly needed.
+        
+        CRITICAL: Automatically switches between configured networks based on availability.
+        If current network has no IP, will try others in order."""
+        skipped_ssid = None  # Track network to skip (one that failed)
+        
         # First, check if already associated with Wi-Fi (lightweight iw check)
         if self.is_wifi_associated():
-            # Check if we have an IP
-            lan_ip = self.get_usable_lan_ip()
-            if lan_ip:
-                current_ssid = self.get_current_wifi_ssid()
-                print(f"[NetworkManager] Wi-Fi associated ({current_ssid or 'unknown'}), IP: {lan_ip}")
-                return True
+            current_ssid = self.get_current_wifi_ssid()
             
-            # Associated but no IP - likely DHCP issue, don't force reconnect
-            # Give DHCP more time instead of disrupting the association
-            print("[NetworkManager] Wi-Fi associated but no IP - waiting for DHCP, not reconnecting")
-            return False
+            # Check if currently associated network is in our config list
+            if not self._is_ssid_in_networks(current_ssid, networks):
+                print(f"[NetworkManager] Associated with '{current_ssid}' but not in config list - disconnecting")
+                skipped_ssid = current_ssid
+                self.disconnect_wifi()
+                time.sleep(2)
+                # Fall through to connection logic below
+            else:
+                # Check if we have an IP
+                lan_ip = self.get_usable_lan_ip()
+                if lan_ip:
+                    print(f"[NetworkManager] Wi-Fi associated ({current_ssid}), IP: {lan_ip}")
+                    return True
+                
+                # Associated to configured network but no IP - try next configured network
+                print(f"[NetworkManager] Associated to {current_ssid} but no IP - trying next configured network...")
+                skipped_ssid = current_ssid
+                self.disconnect_wifi()
+                time.sleep(2)
+                # Fall through to try other networks in order
 
-        # Not associated - try each configured network in order
+        # Not associated (or we just disconnected) - try each configured network in order
         print("[NetworkManager] Wi-Fi not associated, attempting connection...")
         for net in networks:
             ssid = net.get("ssid", "").strip()
             pwd = net.get("password", "").strip()
             if not ssid:
+                continue
+            # Skip the network we just disconnected from (it's not working)
+            if ssid == skipped_ssid:
+                print(f"[NetworkManager] Skipping {ssid} (just disconnected, not working)")
                 continue
             print(f"[NetworkManager] Trying {ssid}...")
             if self.connect_wifi(ssid, pwd):
@@ -382,5 +411,8 @@ class NetworkManager:
                 if lan_ip:
                     print(f"[NetworkManager] Connected to {ssid} (LAN IP: {lan_ip})")
                     return True
-                print(f"[NetworkManager] Connected to {ssid} but no usable LAN IP")
+                print(f"[NetworkManager] Connected to {ssid} but no usable LAN IP - will try next")
+                # Disconnect and try next network
+                self.disconnect_wifi()
+                time.sleep(1)
         return False
