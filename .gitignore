@@ -37,6 +37,7 @@ c/bin/
 # Logs
 *.log
 sync_to_pi.sh
+DEV_MEMO.md
 
 # Fonts (large binary files, user provides their own)
 fonts/*.ttf

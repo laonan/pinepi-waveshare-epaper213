@@ -47,15 +47,25 @@ class WSClient:
 
             try:
                 print(f"[WSClient] Connecting to {url} (token {self._token_hint()})...")
-                async with websockets.connect(
-                    url,
-                    ping_interval=None,
-                    ping_timeout=None,
-                    close_timeout=5,
-                    open_timeout=10,  # Prevent hanging on connection when network is down
-                ) as ws:
-                    # Authentication
-                    await ws.send(self._auth_message())
+                
+                # Wrap entire connection attempt in timeout to prevent hanging
+                ws = await asyncio.wait_for(
+                    websockets.connect(
+                        url,
+                        ping_interval=None,
+                        ping_timeout=None,
+                        close_timeout=5,
+                        open_timeout=10,
+                    ),
+                    timeout=15  # Total connection timeout including handshake
+                )
+                
+                try:
+                    # Authentication with timeout
+                    await asyncio.wait_for(
+                        ws.send(self._auth_message()),
+                        timeout=5
+                    )
                     print("[WSClient] Connected; auth token sent")
 
                     async for message in ws:
@@ -76,6 +86,8 @@ class WSClient:
                             if await self._handle_text_message(ws, text):
                                 continue
                             print(f"[WSClient] Text message: {text}")
+                finally:
+                    await ws.close()
 
             except ConnectionClosed as e:
                 print(f"[WSClient] Connection closed: {e}, reconnecting in 5s...")

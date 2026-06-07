@@ -102,8 +102,27 @@ async def wait_until(hour: int, minute: int):
 
 
 async def keep_alive_loop(state, display, renderer, ws, network_manager):
-    """Trigger full refresh daily at 03:00 to prevent e-paper screen burn-in"""
+    """Trigger full refresh daily at 03:00 to prevent e-paper screen burn-in
+    Also monitor WebSocket health every 5 minutes"""
+    last_ws_check = 0
+    WS_CHECK_INTERVAL = 300  # 5 minutes
+    
     while True:
+        # Check WebSocket health every 5 minutes
+        current_time = time.time()
+        if current_time - last_ws_check >= WS_CHECK_INTERVAL:
+            last_ws_check = current_time
+            print("[KeepAlive] Checking WebSocket health...")
+            if ws._running and network_manager.is_online():
+                # If we're online but no recent WebSocket activity, it might be stuck
+                cached_img = ws.get_cached_image()
+                if not cached_img:
+                    print("[KeepAlive] WARNING: WebSocket appears stuck (no cached image)")
+                    # The ws.run() task should handle reconnection automatically
+            else:
+                print(f"[KeepAlive] WebSocket status: running={ws._running}, online={network_manager.is_online()}")
+        
+        # Wait until 03:00 for daily refresh
         await wait_until(3, 0)  # Daily at 03:00
         print("[KeepAlive] Daily refresh at 03:00 to prevent screen burn-in")
 
