@@ -68,24 +68,58 @@ class WSClient:
                     )
                     print("[WSClient] Connected; auth token sent")
 
-                    async for message in ws:
-                        if isinstance(message, bytes) and len(message) == 4000:
-                            # Server sends landscape (250×122), convert to portrait (122×250)
-                            img = Image.frombytes("1", (250, 122), message)
-                            img = img.rotate(270, expand=True)
-                            if img.size != (122, 250):
-                                img = img.resize((122, 250))
-                            display_bytes = img.tobytes()
-                            self._cached_image = display_bytes
-                            print("[WSClient] Received 4000-byte image")
-                            # If currently on Page 1, flush to screen immediately
-                            if self.state.current_page == 1:
-                                self.display.send(display_bytes)
-                        else:
-                            text = message.decode("utf-8", errors="ignore") if isinstance(message, bytes) else str(message)
-                            if await self._handle_text_message(ws, text):
-                                continue
-                            print(f"[WSClient] Text message: {text}")
+                    # Add a task to monitor connection health
+                    last_pong_time = time.time()
+                    PING_INTERVAL = 30  # Send ping every 30 seconds
+                    CONNECTION_TIMEOUT = 60  # Consider dead after 60 seconds without activity
+                    
+                    async def ping_loop():
+                        """Send periodic pings to detect dead connections"""
+                        nonlocal last_pong_time
+                        while True:
+                            await asyncio.sleep(PING_INTERVAL)
+                            try:
+                                await asyncio.wait_for(ws.ping(), timeout=5)
+                                last_pong_time = time.time()
+                                print("[WSClient] Ping sent successfully")
+                            except Exception:
+                                break
+                    
+                    ping_task = asyncio.create_task(ping_loop())
+                    
+                    try:
+                        async for message in ws:
+                            # Update last activity on any message
+                            last_pong_time = time.time()
+                            
+                            if isinstance(message, bytes) and len(message) == 4000:
+                                # Server sends landscape (250×122), convert to portrait (122×250)
+                                img = Image.frombytes("1", (250, 122), message)
+                                img = img.rotate(270, expand=True)
+                                if img.size != (122, 250):
+                                    img = img.resize((122, 250))
+                                display_bytes = img.tobytes()
+                                self._cached_image = display_bytes
+                                print("[WSClient] Received 4000-byte image")
+                                # If currently on Page 1, flush to screen immediately
+                                if self.state.current_page == 1:
+                                    self.display.send(display_bytes)
+                            else:
+                                text = message.decode("utf-8", errors="ignore") if isinstance(message, bytes) else str(message)
+                                if await self._handle_text_message(ws, text):
+                                    continue
+                                print(f"[WSClient] Text message: {text}")
+                            
+                            # Check if connection is stale
+                            if time.time() - last_pong_time > CONNECTION_TIMEOUT:
+                                print("[WSClient] Connection appears dead (no activity for 60s)")
+                                break
+                    finally:
+                        ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
                 finally:
                     await ws.close()
 
