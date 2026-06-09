@@ -266,6 +266,47 @@ class NetworkManager:
             print(f"[NetworkManager] Failed to connect {ssid}: {e}")
             return False
 
+    def _configure_captive_portal_dns(self) -> bool:
+        """Configure dnsmasq via NetworkManager to redirect all DNS to AP gateway.
+        This makes devices detect captive portal and auto-open the config page."""
+        ap_ip = self.AP_GATEWAY_IP
+        try:
+            # Set dnsmasq options: redirect all DNS queries to our IP
+            subprocess.run(
+                ["nmcli", "connection", "modify", self.AP_CONNECTION_NAME,
+                 "ipv4.dns", ap_ip,
+                 "+connection.dns-options", "ndots:5"],
+                capture_output=True, timeout=5
+            )
+            # Write dnsmasq config to redirect all hosts to AP IP (captive portal)
+            dnsmasq_conf = (
+                f"# PinePi captive portal DNS redirect\n"
+                f"address=/#/{ap_ip}\n"  # Redirect ALL domains to AP IP
+                f"no-resolv\n"
+            )
+            conf_path = "/etc/NetworkManager/dnsmasq-shared.d/pinepi-captive.conf"
+            subprocess.run(
+                ["sudo", "bash", "-c", f"mkdir -p /etc/NetworkManager/dnsmasq-shared.d && echo '{dnsmasq_conf}' > {conf_path}"],
+                capture_output=True, timeout=5
+            )
+            print(f"[NetworkManager] Captive portal DNS configured (all -> {ap_ip})")
+            return True
+        except Exception as e:
+            print(f"[NetworkManager] Failed to configure captive portal DNS: {e}")
+            return False
+
+    def _remove_captive_portal_dns(self) -> None:
+        """Remove captive portal DNS redirect when leaving AP mode"""
+        try:
+            conf_path = "/etc/NetworkManager/dnsmasq-shared.d/pinepi-captive.conf"
+            subprocess.run(
+                ["sudo", "rm", "-f", conf_path],
+                capture_output=True, timeout=5
+            )
+            print("[NetworkManager] Captive portal DNS config removed")
+        except Exception as e:
+            print(f"[NetworkManager] Failed to remove captive portal DNS: {e}")
+
     def create_ap(self) -> bool:
         """Create AP hotspot (requires Wi-Fi AP mode support).
         Captures stderr for detailed error logging."""
@@ -289,6 +330,7 @@ class NetworkManager:
                 )
                 if up_result.returncode == 0:
                     print(f"[NetworkManager] AP mode enabled (existing profile): {ssid}")
+                    self._configure_captive_portal_dns()
                     return True
                 else:
                     print(f"[NetworkManager] Failed to start existing AP: {up_result.stderr}")
@@ -309,6 +351,7 @@ class NetworkManager:
             )
             if result.returncode == 0:
                 print(f"[NetworkManager] AP mode enabled: {ssid}")
+                self._configure_captive_portal_dns()
                 return True
             else:
                 print(f"[NetworkManager] AP mode failed: {result.stderr}")
@@ -329,6 +372,7 @@ class NetworkManager:
             )
             if result.returncode == 0:
                 print("[NetworkManager] AP mode stopped")
+                self._remove_captive_portal_dns()
                 return True
             else:
                 print(f"[NetworkManager] AP stop failed: {result.stderr}")

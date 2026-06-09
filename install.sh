@@ -41,7 +41,7 @@ fi
 # ------------------------------------------------------------------
 # 2. System dependencies
 # ------------------------------------------------------------------
-yellow "[1/7] Installing system dependencies..."
+yellow "[1/8] Installing system dependencies..."
 apt-get update -qq
 apt-get install -y -qq \
     liblgpio-dev \
@@ -59,7 +59,7 @@ systemctl enable --now NetworkManager >/dev/null 2>&1 || true
 # ------------------------------------------------------------------
 # 3. Create directory structure & ensure socket directory permissions
 # ------------------------------------------------------------------
-yellow "[2/7] Creating directory structure..."
+yellow "[2/8] Creating directory structure..."
 mkdir -p "${PINEPI_DIR}/bin"
 mkdir -p "${PINEPI_DIR}/core"
 mkdir -p "${CONFIG_DIR}"
@@ -73,7 +73,7 @@ rm -f /tmp/pinepi.sock /tmp/pinepi-touch.sock 2>/dev/null || true
 # ------------------------------------------------------------------
 # 4. Create Python venv & install dependencies
 # ------------------------------------------------------------------
-yellow "[3/7] Setting up Python virtual environment..."
+yellow "[3/8] Setting up Python virtual environment..."
 if [ ! -d "${PINEPI_DIR}/venv" ]; then
     python3 -m venv "${PINEPI_DIR}/venv"
 fi
@@ -101,7 +101,7 @@ fi
 # ------------------------------------------------------------------
 # 5. Deploy C binary (display driver)
 # ------------------------------------------------------------------
-yellow "[4/7] Deploying display driver..."
+yellow "[4/8] Deploying display driver..."
 if [ -f "c/pinepi" ]; then
     cp "c/pinepi" "${PINEPI_DIR}/bin/pinepi-waveshare-epaper213"
 elif [ -f "release/pinepi-waveshare-epaper213" ]; then
@@ -119,7 +119,7 @@ chmod +x "${PINEPI_DIR}/bin/pinepi-waveshare-epaper213"
 # ------------------------------------------------------------------
 # 6. Deploy Python source
 # ------------------------------------------------------------------
-yellow "[5/7] Deploying Python core..."
+yellow "[5/8] Deploying Python core..."
 if [ -d "python" ]; then
     cp -r python/* "${PINEPI_DIR}/core/"
 elif [ -d "core" ]; then
@@ -147,7 +147,7 @@ fi
 # ------------------------------------------------------------------
 # 7. Register systemd service
 # ------------------------------------------------------------------
-yellow "[6/7] Registering systemd service..."
+yellow "[6/8] Registering systemd service..."
 
 # Default config
 if [ ! -f "${CONFIG_DIR}/config.json" ]; then
@@ -185,9 +185,30 @@ else
 fi
 
 # ------------------------------------------------------------------
-# 8. Configure sudoers for web server reboot/shutdown
+# 8. Enable dnsmasq in NetworkManager (for captive portal)
 # ------------------------------------------------------------------
-yellow "[7/7] Configuring sudoers for web control..."
+yellow "[7/8] Configuring NetworkManager dnsmasq for captive portal..."
+NM_CONF="/etc/NetworkManager/NetworkManager.conf"
+if grep -q "^dns=dnsmasq" "$NM_CONF" 2>/dev/null; then
+    yellow "  dnsmasq already configured in NetworkManager, skipping"
+else
+    # Check if [main] section exists
+    if grep -q "^\[main\]" "$NM_CONF" 2>/dev/null; then
+        # Insert dns=dnsmasq after [main] line
+        sed -i '/^\[main\]/a dns=dnsmasq' "$NM_CONF"
+    else
+        # Append [main] section
+        echo -e "\n[main]\ndns=dnsmasq" >> "$NM_CONF"
+    fi
+    mkdir -p /etc/NetworkManager/dnsmasq-shared.d
+    systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager 2>/dev/null || true
+    green "  dnsmasq enabled in NetworkManager"
+fi
+
+# ------------------------------------------------------------------
+# 9. Configure sudoers for web server reboot/shutdown
+# ------------------------------------------------------------------
+yellow "[8/8] Configuring sudoers for web control..."
 
 # Get the non-root user who invoked sudo, or prompt if not available
 PINEPI_USER="${SUDO_USER:-}"
