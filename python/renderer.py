@@ -210,6 +210,16 @@ class Renderer:
         img.paste(qr, (px, py))
 
         draw.text((5, 2), label, fill=0, font=self.font)
+        if lan_ip:
+            hint = "Please visit the URL below for configuration."
+            hint_w = self.font_small.getbbox(hint)[2]
+            url_w = self.font_small.getbbox(url)[2]
+            hint_x = max(0, (self.CANVAS_W - hint_w) // 2)
+            url_x = max(0, (self.CANVAS_W - url_w) // 2)
+            hint_y = py + qh + 2
+            url_y = hint_y + 12
+            draw.text((hint_x, hint_y), hint, fill=0, font=self.font_small)
+            draw.text((url_x, url_y), url, fill=0, font=self.font_small)
         self._draw_footer(draw, "Page: 3/3 (Config)")
         return self._to_display_bytes(img)
 
@@ -269,6 +279,16 @@ class Renderer:
         img.paste(qr, (px, py))
 
         draw.text((5, 2), label, fill=0, font=self.font)
+        if mode == "lan" and lan_ip:
+            hint = "Please visit the URL below for configuration."
+            hint_w = self.font_small.getbbox(hint)[2]
+            url_w = self.font_small.getbbox(url)[2]
+            hint_x = max(0, (self.CANVAS_W - hint_w) // 2)
+            url_x = max(0, (self.CANVAS_W - url_w) // 2)
+            hint_y = py + qh + 2
+            url_y = hint_y + 12
+            draw.text((hint_x, hint_y), hint, fill=0, font=self.font_small)
+            draw.text((url_x, url_y), url, fill=0, font=self.font_small)
         self._draw_footer(draw, "Page: 3/3 (Config)")
         return self._to_display_bytes(img)
 
