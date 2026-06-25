@@ -183,7 +183,30 @@ class NetworkManager:
             return ""
 
     def get_current_wifi_ssid(self) -> Optional[str]:
-        """Get currently connected Wi-Fi SSID"""
+        """Get currently associated station-mode Wi-Fi SSID.
+
+        Prefer `iw ... link` because `nmcli device wifi list` is a scan view
+        and may mark the local AP hotspot as active while we are in config mode.
+        """
+        try:
+            result = subprocess.run(
+                ["iw", "dev", "wlan0", "link"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("SSID:"):
+                        ssid = line.split("SSID:", 1)[1].strip()
+                        return ssid or None
+        except Exception:
+            pass
+
+        # Fallback for systems without iw. Avoid the scan fallback while AP is
+        # active because NetworkManager can report our own hotspot as in use.
+        if self.is_ap_active():
+            return None
+
         try:
             result = subprocess.run(
                 ["nmcli", "-t", "-f", "ACTIVE,SSID", "device", "wifi", "list"],
@@ -192,7 +215,7 @@ class NetworkManager:
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
                     if line.startswith('yes:'):
-                        return line.split(':')[1] if ':' in line else None
+                        return line.split(':', 1)[1] if ':' in line else None
             return None
         except Exception:
             return None

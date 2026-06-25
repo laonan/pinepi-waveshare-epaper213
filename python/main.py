@@ -154,6 +154,7 @@ async def network_loop(config, network_manager, state_machine, display, renderer
     last_mode = None  # "lan" | "ap" | None
     last_wifi_reconnect_attempt = 0  # Track last reconnection attempt time
     WIFI_RECONNECT_INTERVAL = 300  # 5 minutes between reconnection attempts (was 60s, too aggressive)
+    DHCP_GRACE_PERIOD = 60  # Time to wait for DHCP after detecting an active Wi-Fi association
     lan_ip_missing_count = 0  # Track consecutive missing LAN IP checks
     LAN_IP_MISSING_THRESHOLD = 3  # Require 3 consecutive failures (45 seconds) before triggering AP mode
     grace_period_end = 0  # Grace period after reconnection to avoid flip-flopping
@@ -163,6 +164,9 @@ async def network_loop(config, network_manager, state_machine, display, renderer
         net_state = network_manager.get_network_state()
         has_lan_ip = net_state["lan_ip"] is not None
         mode = net_state["mode"]
+        ap_active = net_state["ap_active"]
+        current_time = time.time()
+        in_grace_period = current_time < grace_period_end
 
         # Log state changes
         if mode != last_mode:
@@ -180,21 +184,17 @@ async def network_loop(config, network_manager, state_machine, display, renderer
         if has_lan_ip:
             lan_ip_missing_count = 0  # Reset counter on successful detection
             # If we recently reconnected, extend grace period
-            if time.time() < grace_period_end:
-                grace_period_end = time.time() + 30  # Extend grace period
+            if in_grace_period:
+                grace_period_end = current_time + 30  # Extend grace period
         else:
-            lan_ip_missing_count += 1
-
-        # Only trigger AP mode after sustained absence of LAN IP
-        # This prevents flip-flopping during DHCP renewals (~70 second outages observed)
-        should_ap_be_active = lan_ip_missing_count >= LAN_IP_MISSING_THRESHOLD
-
-        # When in grace period, don't attempt any reconnection (avoid nmcli interference with netplan)
-        in_grace_period = time.time() < grace_period_end
+            # Do not count DHCP wait time as an AP fallback signal. Without this,
+            # a Pi that is associated but still waiting for DHCP can be forced
+            # back into AP mode before the grace period expires.
+            if not in_grace_period:
+                lan_ip_missing_count += 1
 
         # When no LAN IP detected, try to reconnect - but only if grace period passed
         if not has_lan_ip and not in_grace_period and lan_ip_missing_count >= LAN_IP_MISSING_THRESHOLD - 1:
-            current_time = time.time()
             if current_time - last_wifi_reconnect_attempt >= WIFI_RECONNECT_INTERVAL:
                 if config.wifi_networks:
                     mode_str = "AP mode" if ap_active else "Station mode (no IP)"
@@ -205,20 +205,33 @@ async def network_loop(config, network_manager, state_machine, display, renderer
                     if current_ssid:
                         print(f"[NetworkLoop] Already associated with {current_ssid}, waiting for DHCP...")
                         # Give DHCP more time before attempting reconnection
-                        grace_period_end = time.time() + 60  # 60 second grace period
+                        grace_period_end = current_time + DHCP_GRACE_PERIOD
+                        lan_ip_missing_count = 0
+                        in_grace_period = True
                     else:
                         reconnected = network_manager.ensure_best_wifi(config.wifi_networks)
                         if reconnected:
                             print("[NetworkLoop] Wi-Fi reconnected! 5-minute grace period starting.")
-                            grace_period_end = time.time() + 300  # 5-minute grace period
+                            grace_period_end = current_time + 300  # 5-minute grace period
+                            in_grace_period = True
                             net_state = network_manager.get_network_state()
                             has_lan_ip = net_state["lan_ip"] is not None
+                            ap_active = net_state["ap_active"]
                             lan_ip_missing_count = 0
                         else:
                             print("[NetworkLoop] Wi-Fi reconnection failed, will retry in 5 minutes")
                     last_wifi_reconnect_attempt = current_time
                 else:
                     last_wifi_reconnect_attempt = current_time
+
+        # Only trigger AP mode after sustained absence of LAN IP and outside
+        # any DHCP/reconnect grace period. This prevents flip-flopping during
+        # DHCP renewals (~70 second outages observed).
+        should_ap_be_active = (
+            not has_lan_ip
+            and not in_grace_period
+            and lan_ip_missing_count >= LAN_IP_MISSING_THRESHOLD
+        )
 
         if should_ap_be_active and not ap_active:
             print("[NetworkLoop] No usable LAN IP -> starting AP mode")
@@ -232,8 +245,10 @@ async def network_loop(config, network_manager, state_machine, display, renderer
                     print("[NetworkLoop] AP mode confirmed active")
                 else:
                     print("[NetworkLoop] AP start reported success but AP is not active, will retry")
+                net_state = network_manager.get_network_state()
             else:
                 print("[NetworkLoop] AP mode failed to start, will retry")
+                net_state = network_manager.get_network_state()
 
             # Refresh Page 3 if needed (skip if display is busy from user interaction)
             if state_machine.current_page == 3 and display.can_refresh:
@@ -248,6 +263,7 @@ async def network_loop(config, network_manager, state_machine, display, renderer
                 print("[NetworkLoop] AP mode stopped")
             else:
                 print("[NetworkLoop] AP stop failed, will retry")
+            net_state = network_manager.get_network_state()
 
             # Refresh Page 3 if needed (skip if display is busy from user interaction)
             if state_machine.current_page == 3 and display.can_refresh:

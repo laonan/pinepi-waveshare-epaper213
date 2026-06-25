@@ -210,20 +210,16 @@ class Renderer:
         img.paste(qr, (px, py))
 
         draw.text((5, 2), label, fill=0, font=self.font)
-        # Show URL and hint in both LAN and AP modes
-        hint = "Please visit the URL below for configuration."
-        hint_w = self.font_small.getbbox(hint)[2]
-        # In LAN mode, show the device IP; in AP mode, show AP gateway IP
+        # Show the config URL in both LAN and AP modes.
+        # AP Wi-Fi QR codes are larger than LAN URL QR codes, so keep this to
+        # one line to avoid colliding with the footer on the 122px-tall canvas.
         if lan_ip:
             display_url = url  # http://192.168.x.x:8080
         else:
             display_url = "http://10.42.0.1:8080"
         url_w = self.font_small.getbbox(display_url)[2]
-        hint_x = max(0, (self.CANVAS_W - hint_w) // 2)
         url_x = max(0, (self.CANVAS_W - url_w) // 2)
-        hint_y = py + qh + 2
-        url_y = hint_y + 12
-        draw.text((hint_x, hint_y), hint, fill=0, font=self.font_small)
+        url_y = min(py + qh + 2, 98)
         draw.text((url_x, url_y), display_url, fill=0, font=self.font_small)
         self._draw_footer(draw, "Page: 3/3 (Config)")
         return self._to_display_bytes(img)
@@ -284,20 +280,16 @@ class Renderer:
         img.paste(qr, (px, py))
 
         draw.text((5, 2), label, fill=0, font=self.font)
-        # Show URL and hint in both LAN and AP modes
-        hint = "Please visit the URL below for configuration."
-        hint_w = self.font_small.getbbox(hint)[2]
-        # In LAN mode, show the device IP; in AP mode, show AP gateway IP
+        # Show the config URL in both LAN and AP modes.
+        # AP Wi-Fi QR codes are larger than LAN URL QR codes, so keep this to
+        # one line to avoid colliding with the footer on the 122px-tall canvas.
         if mode == "lan" and lan_ip:
             display_url = url  # http://192.168.x.x:8080
         else:
             display_url = "http://10.42.0.1:8080"
         url_w = self.font_small.getbbox(display_url)[2]
-        hint_x = max(0, (self.CANVAS_W - hint_w) // 2)
         url_x = max(0, (self.CANVAS_W - url_w) // 2)
-        hint_y = py + qh + 2
-        url_y = hint_y + 12
-        draw.text((hint_x, hint_y), hint, fill=0, font=self.font_small)
+        url_y = min(py + qh + 2, 98)
         draw.text((url_x, url_y), display_url, fill=0, font=self.font_small)
         self._draw_footer(draw, "Page: 3/3 (Config)")
         return self._to_display_bytes(img)
