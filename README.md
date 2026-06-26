@@ -71,6 +71,15 @@ pinepi-waveshare-epaper213/
 Tap anywhere on screen to cycle through pages in single direction.
 
 > **⚠️ Operation Tip:** E-ink displays have very slow refresh speeds. Please wait patiently after page turns, restarts or other operations; waiting times can sometimes last several minutes (such as after a power cycle or system reboot).
+
+### Throttled Message Refresh
+
+To protect the e-paper panel, WebSocket-pushed messages are queued and refreshed at a minimum 180-second interval:
+
+- Messages are displayed one by one in the order received (FIFO).
+- If 180s+ have passed since the last refresh, a new message displays immediately; otherwise it waits in the queue.
+- Touch page switches and ping/pong are not throttled and remain instant.
+
 ---
 
 ## Installation
