@@ -2,11 +2,17 @@ import asyncio
 import json
 import time
 import websockets
+from collections import deque
 from websockets.exceptions import ConnectionClosed
 from PIL import Image
 
 class WSClient:
     """WebSocket Secure client: connects to cloud, receives 4000-byte bitmap images"""
+
+    # E-paper safe-refresh throttling: enforce a minimum interval between physical
+    # screen refreshes to prevent panel damage from too-frequent updates.
+    MIN_REFRESH_INTERVAL = 180  # Seconds; e-paper minimum safe refresh interval
+    REFRESH_POLL_INTERVAL = 5   # Seconds; how often the consumer polls the queue
 
     def __init__(self, config, display_client, state_machine, renderer=None):
         self.config = config
@@ -15,6 +21,12 @@ class WSClient:
         self.renderer = renderer
         self._cached_image: bytes = b""
         self._running = True
+        # Ordered queue of pending messages awaiting a throttled refresh.
+        # Each item: {"received_at": float, "payload": bytes, "shown": bool}
+        self._msg_queue: deque = deque()
+        # Timestamp when the e-paper finished its last message refresh.
+        # Initialized to 0.0 so the first queued message refreshes immediately.
+        self._latest_refresh_at: float = 0.0
 
     def get_cached_image(self) -> bytes:
         return self._cached_image
@@ -34,6 +46,8 @@ class WSClient:
         return f"len={len(token)} tail=...{token[-4:]}"
 
     async def run(self):
+        # Start the throttled refresh consumer (enforces MIN_REFRESH_INTERVAL between refreshes)
+        asyncio.create_task(self._refresh_consumer())
         while self._running:
             url = self.config.wss_url
             if not url or not url.startswith("wss://"):
@@ -99,11 +113,9 @@ class WSClient:
                                 if img.size != (122, 250):
                                     img = img.resize((122, 250))
                                 display_bytes = img.tobytes()
-                                self._cached_image = display_bytes
-                                print("[WSClient] Received 4000-byte image")
-                                # If currently on Page 1, flush to screen immediately
-                                if self.state.current_page == 1:
-                                    self.display.send(display_bytes)
+                                print("[WSClient] Received 4000-byte image; enqueuing")
+                                # Enqueue for ordered, throttled refresh (protects e-paper)
+                                self._enqueue(display_bytes)
                             else:
                                 text = message.decode("utf-8", errors="ignore") if isinstance(message, bytes) else str(message)
                                 if await self._handle_text_message(ws, text):
@@ -138,6 +150,48 @@ class WSClient:
     def stop(self):
         self._running = False
 
+    def _enqueue(self, payload: bytes) -> None:
+        """Add a message to the ordered refresh queue with its reception timestamp."""
+        self._msg_queue.append({
+            "received_at": time.time(),
+            "payload": payload,
+            "shown": False,
+        })
+        print(f"[WSClient] Message enqueued (queue size={len(self._msg_queue)})")
+
+    def _refresh_screen(self, payload: bytes) -> None:
+        """Update the cached image and physically refresh the screen if on Page 1."""
+        self._cached_image = payload
+        if self.state.current_page == 1:
+            ok = self.display.send(payload)
+            print(f"[WSClient] Display refresh sent={ok}")
+
+    async def _refresh_consumer(self) -> None:
+        """Poll the message queue and refresh the screen in strict reception order,
+        honoring the e-paper minimum safe refresh interval (MIN_REFRESH_INTERVAL).
+
+        Gate is based solely on LATEST_REFRESH_AT: if >= MIN_REFRESH_INTERVAL has
+        passed since the last refresh, the head message is shown immediately
+        regardless of its own reception timestamp.
+        """
+        while self._running:
+            await asyncio.sleep(self.REFRESH_POLL_INTERVAL)
+            if not self._msg_queue:
+                continue
+            elapsed = time.time() - self._latest_refresh_at
+            if elapsed >= self.MIN_REFRESH_INTERVAL:
+                # Dequeue head, refresh, and record the refresh timestamp
+                item = self._msg_queue.popleft()
+                self._refresh_screen(item["payload"])
+                item["shown"] = True
+                self._latest_refresh_at = time.time()
+                print(
+                    f"[WSClient] Refreshed queued message "
+                    f"(waited {time.time() - item['received_at']:.0f}s, "
+                    f"queue remaining={len(self._msg_queue)})"
+                )
+            # else: too soon since last refresh; retry on the next polling cycle
+
     async def _handle_text_message(self, ws, text: str) -> bool:
         try:
             data = json.loads(text)
@@ -163,11 +217,9 @@ class WSClient:
                 return True
 
             img = self.renderer.render_page1_message(str(title), str(content))
-            self._cached_image = img
-            print(f"[WSClient] Message rendered title={str(title)[:32]!r}")
-            if self.state.current_page == 1:
-                ok = self.display.send(img)
-                print(f"[WSClient] Message displayed sent={ok}")
+            print(f"[WSClient] Message rendered title={str(title)[:32]!r}; enqueuing")
+            # Enqueue for ordered, throttled refresh (protects e-paper)
+            self._enqueue(img)
             return True
 
         return False
