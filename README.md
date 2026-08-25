@@ -190,6 +190,11 @@ sudo iw dev wlan0 set power_save off
 
 ---
 
+## Usage
+
+Refer to the `examples` directory for usage.
+
+---
 
 ## Waveshare 2.13inch E-Paper HAT Documentation
 
