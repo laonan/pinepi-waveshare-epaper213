@@ -13,6 +13,8 @@ class WSClient:
     # screen refreshes to prevent panel damage from too-frequent updates.
     MIN_REFRESH_INTERVAL = 180  # Seconds; e-paper minimum safe refresh interval
     REFRESH_POLL_INTERVAL = 5   # Seconds; how often the consumer polls the queue
+    CONNECTION_TIMEOUT = 60     # Consider WebSocket dead after 60s without activity
+    PING_INTERVAL = 30          # Send ping every 30 seconds
 
     def __init__(self, config, display_client, state_machine, renderer=None):
         self.config = config
@@ -21,6 +23,9 @@ class WSClient:
         self.renderer = renderer
         self._cached_image: bytes = b""
         self._running = True
+        self._connected = False
+        self._last_activity = 0.0
+        self.connected = asyncio.Event()
         # Ordered queue of pending messages awaiting a throttled refresh.
         # Each item: {"received_at": float, "payload": bytes, "shown": bool}
         self._msg_queue: deque = deque()
@@ -83,18 +88,17 @@ class WSClient:
                     print("[WSClient] Connected; auth token sent")
 
                     # Add a task to monitor connection health
-                    last_pong_time = time.time()
-                    PING_INTERVAL = 30  # Send ping every 30 seconds
-                    CONNECTION_TIMEOUT = 60  # Consider dead after 60 seconds without activity
-                    
+                    self._connected = True
+                    self._last_activity = time.time()
+                    self.connected.set()
+
                     async def ping_loop():
                         """Send periodic pings to detect dead connections"""
-                        nonlocal last_pong_time
                         while True:
-                            await asyncio.sleep(PING_INTERVAL)
+                            await asyncio.sleep(self.PING_INTERVAL)
                             try:
                                 await asyncio.wait_for(ws.ping(), timeout=5)
-                                last_pong_time = time.time()
+                                self._last_activity = time.time()
                                 print("[WSClient] Ping sent successfully")
                             except Exception:
                                 break
@@ -104,7 +108,7 @@ class WSClient:
                     try:
                         async for message in ws:
                             # Update last activity on any message
-                            last_pong_time = time.time()
+                            self._last_activity = time.time()
                             
                             if isinstance(message, bytes) and len(message) == 4000:
                                 # Server sends landscape (250×122), convert to portrait (122×250)
@@ -123,7 +127,7 @@ class WSClient:
                                 print(f"[WSClient] Text message: {text}")
                             
                             # Check if connection is stale
-                            if time.time() - last_pong_time > CONNECTION_TIMEOUT:
+                            if time.time() - self._last_activity > self.CONNECTION_TIMEOUT:
                                 print("[WSClient] Connection appears dead (no activity for 60s)")
                                 break
                     finally:
@@ -133,6 +137,8 @@ class WSClient:
                         except asyncio.CancelledError:
                             pass
                 finally:
+                    self._connected = False
+                    self._last_activity = 0.0
                     await ws.close()
 
             except ConnectionClosed as e:
@@ -223,3 +229,9 @@ class WSClient:
             return True
 
         return False
+
+    def is_online(self) -> bool:
+        """Return True if the WebSocket connection is up and healthy."""
+        if not self._connected:
+            return False
+        return time.time() - self._last_activity <= self.CONNECTION_TIMEOUT

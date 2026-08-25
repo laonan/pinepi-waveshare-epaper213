@@ -311,6 +311,7 @@ async def main():
     nm = NetworkManager(config)
     ws = WSClient(config, display, state, renderer)
     g_ws_client = ws
+    renderer.ws_client = ws
     web = WebServer(config, nm, port=8080)
 
     # ------------------------------------------------------------------
@@ -322,6 +323,16 @@ async def main():
     # C process binds UDS immediately on startup, just wait for process creation
     print("[Main] Waiting 1s for display process to start...")
     await asyncio.sleep(1)
+
+    # ------------------------------------------------------------------
+    # Start WebSocket early so the first frame can reflect the real status
+    # ------------------------------------------------------------------
+    ws_task = asyncio.create_task(ws.run())
+    try:
+        # Give the WebSocket a short moment to connect before painting the first frame
+        await asyncio.wait_for(ws.connected.wait(), timeout=2)
+    except asyncio.TimeoutError:
+        pass
 
     # ------------------------------------------------------------------
     # Send initial Page 1 (blank or cached cloud image)
@@ -342,7 +353,7 @@ async def main():
     touch = TouchListener("/tmp/pinepi-touch.sock", state, display, renderer, ws, nm)
 
     g_tasks = [
-        asyncio.create_task(ws.run()),
+        ws_task,
         asyncio.create_task(touch.run()),
         asyncio.create_task(network_loop(config, nm, state, display, renderer)),
         asyncio.create_task(asyncio.to_thread(web.run)),

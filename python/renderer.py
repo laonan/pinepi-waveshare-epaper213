@@ -27,6 +27,7 @@ class Renderer:
             self.font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 10)
         except Exception:
             pass
+        self.ws_client = None
 
     def _load_font(self) -> ImageFont.ImageFont:
         candidates = [
@@ -80,11 +81,15 @@ class Renderer:
         return img.tobytes()
 
     def _draw_footer(self, draw: ImageDraw.ImageDraw, text: str):
-        """Draw centered footer text at bottom"""
-        bbox = draw.textbbox((0, 0), text, font=self.font_small)
-        tw = bbox[2] - bbox[0]
-        x = (self.CANVAS_W - tw) // 2
-        draw.text((x, 110), text, fill=0, font=self.font_small)
+        """Draw page footer and real-time WebSocket status at the bottom"""
+        draw.text((5, 110), text, fill=0, font=self.font_small)
+        if self.ws_client is not None:
+            online = self.ws_client.is_online()
+            status = "ONLINE" if online else "OFFLINE"
+            bbox = draw.textbbox((0, 0), status, font=self.font_small)
+            sw = bbox[2] - bbox[0]
+            x = self.CANVAS_W - sw - 5
+            draw.text((x, 110), status, fill=0, font=self.font_small)
 
     # ------------------------------------------------------------------
     # Page 1: Cloud Board (default shows "No message" or offline hint)
