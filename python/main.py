@@ -147,7 +147,7 @@ async def keep_alive_loop(state, display, renderer, ws, network_manager):
         display.send(img)
 
 
-async def network_loop(config, network_manager, state_machine, display, renderer):
+async def network_loop(config, network_manager, state_machine, display, renderer, ws):
     """Background coroutine: check network status periodically, auto-switch to AP when no usable LAN IP, ensure Station mode when LAN IP available.
     Designed to be non-intrusive with netplan-managed connections."""
     ap_active = False
@@ -158,8 +158,23 @@ async def network_loop(config, network_manager, state_machine, display, renderer
     lan_ip_missing_count = 0  # Track consecutive missing LAN IP checks
     LAN_IP_MISSING_THRESHOLD = 3  # Require 3 consecutive failures (45 seconds) before triggering AP mode
     grace_period_end = 0  # Grace period after reconnection to avoid flip-flopping
+    last_displayed_ws_online = ws.is_online()
 
     while True:
+        ws_online = ws.is_online()
+        # The footer is part of the e-paper bitmap, so changing the underlying
+        # WebSocket state alone is not enough. Redraw Page 1 when the state
+        # changes, even if no new cloud message arrives.
+        if ws_online != last_displayed_ws_online and state_machine.current_page == 1 and display.can_refresh:
+            cached_img = ws.get_cached_image()
+            if cached_img:
+                img = renderer.render_page1_status(cached_img, ws_online)
+            else:
+                img = renderer.render_page1(is_offline=not ws_online)
+            if display.send(img):
+                last_displayed_ws_online = ws_online
+                print(f"[NetworkLoop] Page 1 footer updated: {'ONLINE' if ws_online else 'OFFLINE'}")
+
         # Get unified network state
         net_state = network_manager.get_network_state()
         has_lan_ip = net_state["lan_ip"] is not None
@@ -355,7 +370,7 @@ async def main():
     g_tasks = [
         ws_task,
         asyncio.create_task(touch.run()),
-        asyncio.create_task(network_loop(config, nm, state, display, renderer)),
+        asyncio.create_task(network_loop(config, nm, state, display, renderer, ws)),
         asyncio.create_task(asyncio.to_thread(web.run)),
         asyncio.create_task(keep_alive_loop(state, display, renderer, ws, nm)),
     ]

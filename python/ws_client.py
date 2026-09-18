@@ -97,10 +97,21 @@ class WSClient:
                         while True:
                             await asyncio.sleep(self.PING_INTERVAL)
                             try:
-                                await asyncio.wait_for(ws.ping(), timeout=5)
+                                # ping() returns a waiter for the pong. Merely
+                                # sending the ping is not proof that the peer
+                                # or network is still reachable.
+                                pong_waiter = await ws.ping()
+                                await asyncio.wait_for(pong_waiter, timeout=5)
                                 self._last_activity = time.time()
-                                print("[WSClient] Ping sent successfully")
+                                print("[WSClient] Ping/pong completed successfully")
                             except Exception:
+                                # Unblock the receive loop so the connection
+                                # cleanup marks the client offline and the
+                                # reconnect loop can establish a fresh socket.
+                                try:
+                                    await ws.close()
+                                except Exception:
+                                    pass
                                 break
                     
                     ping_task = asyncio.create_task(ping_loop())

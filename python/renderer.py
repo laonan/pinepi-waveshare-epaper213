@@ -80,11 +80,12 @@ class Renderer:
             img = img.resize((122, 250))
         return img.tobytes()
 
-    def _draw_footer(self, draw: ImageDraw.ImageDraw, text: str):
+    def _draw_footer(self, draw: ImageDraw.ImageDraw, text: str, online: Optional[bool] = None):
         """Draw page footer and real-time WebSocket status at the bottom"""
         draw.text((5, 110), text, fill=0, font=self.font_small)
-        if self.ws_client is not None:
+        if online is None and self.ws_client is not None:
             online = self.ws_client.is_online()
+        if online is not None:
             status = "ONLINE" if online else "OFFLINE"
             bbox = draw.textbbox((0, 0), status, font=self.font_small)
             sw = bbox[2] - bbox[0]
@@ -148,6 +149,25 @@ class Renderer:
             y += 14
 
         self._draw_footer(draw, "Page: 1/3 (Cloud)")
+        return self._to_display_bytes(img)
+
+    def render_page1_status(self, display_bytes: bytes, online: bool) -> bytes:
+        """Update only the Page 1 footer while preserving the displayed message.
+
+        Cached cloud images are already in portrait/display orientation. Rotate
+        them back to the renderer's landscape canvas, redraw the footer, and
+        convert them back so a connectivity change does not require the message
+        payload to be received again.
+        """
+        if len(display_bytes) != 4000:
+            return display_bytes
+
+        img = Image.frombytes("1", (122, 250), display_bytes).rotate(90, expand=True)
+        draw = ImageDraw.Draw(img)
+        # Clear the old footer before drawing the new status. This also handles
+        # ONLINE -> OFFLINE, where the label becomes wider.
+        draw.rectangle((0, 108, self.CANVAS_W, self.CANVAS_H), fill=255)
+        self._draw_footer(draw, "Page: 1/3 (Cloud)", online=online)
         return self._to_display_bytes(img)
 
     # ------------------------------------------------------------------

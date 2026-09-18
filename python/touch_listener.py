@@ -122,10 +122,13 @@ class TouchListener:
             # Page 1: Cloud dashboard - send latest cached cloud image, or show default/offline page if no cache
             img = self.ws.get_cached_image()
             if img:
+                # Cached message bitmaps contain the footer from the time they
+                # were rendered. Refresh that footer when returning to Page 1
+                # so a status change while viewing another page is reflected.
+                img = self.renderer.render_page1_status(img, self.ws.is_online())
                 sent = self.display.send(img)
             else:
-                is_offline = self.nm.is_online() if self.nm else False
-                img = self.renderer.render_page1(is_offline=not is_offline)
+                img = self.renderer.render_page1(is_offline=not self.ws.is_online())
                 sent = self.display.send(img)
         elif page == 2:
             # Page 2: Local system monitor
