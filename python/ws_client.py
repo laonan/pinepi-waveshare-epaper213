@@ -1,20 +1,26 @@
 import asyncio
 import json
+import random
 import time
-import websockets
 from collections import deque
-from websockets.exceptions import ConnectionClosed
+
+import websockets
 from PIL import Image
+from websockets.exceptions import ConnectionClosed
+
 
 class WSClient:
-    """WebSocket Secure client: connects to cloud, receives 4000-byte bitmap images"""
+    """Resilient cloud WebSocket client for 4000-byte bitmap messages."""
 
-    # E-paper safe-refresh throttling: enforce a minimum interval between physical
-    # screen refreshes to prevent panel damage from too-frequent updates.
-    MIN_REFRESH_INTERVAL = 180  # Seconds; e-paper minimum safe refresh interval
-    REFRESH_POLL_INTERVAL = 5   # Seconds; how often the consumer polls the queue
-    CONNECTION_TIMEOUT = 60     # Consider WebSocket dead after 60s without activity
-    PING_INTERVAL = 30          # Send ping every 30 seconds
+    MIN_REFRESH_INTERVAL = 180
+    REFRESH_POLL_INTERVAL = 5
+    CONNECTION_TIMEOUT = 60
+    PING_INTERVAL = 30
+    PING_TIMEOUT = 8
+    RECONNECT_BASE_DELAY = 2
+    RECONNECT_MAX_DELAY = 60
+    STABLE_CONNECTION_TIME = 120
+    MAX_QUEUED_MESSAGES = 100
 
     def __init__(self, config, display_client, state_machine, renderer=None):
         self.config = config
@@ -25,13 +31,13 @@ class WSClient:
         self._running = True
         self._connected = False
         self._last_activity = 0.0
+        self._ws = None
         self.connected = asyncio.Event()
-        # Ordered queue of pending messages awaiting a throttled refresh.
-        # Each item: {"received_at": float, "payload": bytes, "shown": bool}
+        self._stop_event = asyncio.Event()
+        self._reconnect_now = asyncio.Event()
+        self._refresh_task = None
         self._msg_queue: deque = deque()
-        # Timestamp when the e-paper finished its last message refresh.
-        # Initialized to 0.0 so the first queued message refreshes immediately.
-        self._latest_refresh_at: float = 0.0
+        self._latest_refresh_at = 0.0
 
     def get_cached_image(self) -> bytes:
         return self._cached_image
@@ -50,164 +56,217 @@ class WSClient:
             return "empty"
         return f"len={len(token)} tail=...{token[-4:]}"
 
-    async def run(self):
-        # Start the throttled refresh consumer (enforces MIN_REFRESH_INTERVAL between refreshes)
-        asyncio.create_task(self._refresh_consumer())
-        while self._running:
-            url = self.config.wss_url
-            if not url or not url.startswith("wss://"):
-                print("[WSClient] WSS URL not configured, retry in 10s...")
-                await asyncio.sleep(10)
-                continue
-            if not (self.config.auth_token or "").strip():
-                print("[WSClient] Auth token is empty, retry in 10s...")
-                await asyncio.sleep(10)
-                continue
+    @classmethod
+    def _reconnect_delay(cls, failure_count: int) -> float:
+        """Equal-jitter exponential backoff; bounded to avoid retry storms."""
+        exponent = min(max(failure_count - 1, 0), 10)
+        ceiling = min(
+            cls.RECONNECT_MAX_DELAY,
+            cls.RECONNECT_BASE_DELAY * (2 ** exponent),
+        )
+        return random.uniform(ceiling / 2, ceiling)
 
-            try:
-                print(f"[WSClient] Connecting to {url} (token {self._token_hint()})...")
-                
-                # Wrap entire connection attempt in timeout to prevent hanging
-                ws = await asyncio.wait_for(
-                    websockets.connect(
-                        url,
-                        ping_interval=None,
-                        ping_timeout=None,
-                        close_timeout=5,
-                        open_timeout=10,
-                    ),
-                    timeout=15  # Total connection timeout including handshake
-                )
-                
+    async def _wait_for_retry(self, delay: float) -> None:
+        if self._reconnect_now.is_set():
+            self._reconnect_now.clear()
+            return
+        try:
+            await asyncio.wait_for(self._reconnect_now.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._reconnect_now.clear()
+
+    async def run(self):
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._refresh_consumer())
+
+        failure_count = 0
+        try:
+            while self._running:
+                url = self.config.wss_url
+                if not url or not url.startswith("wss://"):
+                    print("[WSClient] WSS URL not configured; retrying in 10s")
+                    await self._wait_for_retry(10)
+                    continue
+                if not (self.config.auth_token or "").strip():
+                    print("[WSClient] Auth token is empty; retrying in 10s")
+                    await self._wait_for_retry(10)
+                    continue
+
+                connected_at = 0.0
+                ws = None
                 try:
-                    # Authentication with timeout
-                    await asyncio.wait_for(
-                        ws.send(self._auth_message()),
-                        timeout=5
+                    print(f"[WSClient] Connecting to {url} (token {self._token_hint()})...")
+                    ws = await asyncio.wait_for(
+                        websockets.connect(
+                            url,
+                            ping_interval=None,
+                            ping_timeout=None,
+                            close_timeout=5,
+                            open_timeout=10,
+                        ),
+                        timeout=15,
                     )
+                    self._ws = ws
+                    await asyncio.wait_for(ws.send(self._auth_message()), timeout=5)
                     print("[WSClient] Connected; auth token sent")
 
-                    # Add a task to monitor connection health
+                    connected_at = time.monotonic()
                     self._connected = True
-                    self._last_activity = time.time()
+                    self._last_activity = connected_at
                     self.connected.set()
 
                     async def ping_loop():
-                        """Send periodic pings to detect dead connections"""
-                        while True:
+                        while self._running:
                             await asyncio.sleep(self.PING_INTERVAL)
                             try:
-                                # ping() returns a waiter for the pong. Merely
-                                # sending the ping is not proof that the peer
-                                # or network is still reachable.
                                 pong_waiter = await ws.ping()
-                                await asyncio.wait_for(pong_waiter, timeout=5)
-                                self._last_activity = time.time()
+                                await asyncio.wait_for(
+                                    pong_waiter, timeout=self.PING_TIMEOUT
+                                )
+                                self._last_activity = time.monotonic()
                                 print("[WSClient] Ping/pong completed successfully")
-                            except Exception:
-                                # Unblock the receive loop so the connection
-                                # cleanup marks the client offline and the
-                                # reconnect loop can establish a fresh socket.
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                print(
+                                    f"[WSClient] Ping failed ({type(exc).__name__}); closing stale socket"
+                                )
                                 try:
                                     await ws.close()
                                 except Exception:
                                     pass
-                                break
-                    
+                                return
+
                     ping_task = asyncio.create_task(ping_loop())
-                    
                     try:
                         async for message in ws:
-                            # Update last activity on any message
-                            self._last_activity = time.time()
-                            
+                            self._last_activity = time.monotonic()
                             if isinstance(message, bytes) and len(message) == 4000:
-                                # Server sends landscape (250×122), convert to portrait (122×250)
-                                img = Image.frombytes("1", (250, 122), message)
-                                img = img.rotate(270, expand=True)
-                                if img.size != (122, 250):
-                                    img = img.resize((122, 250))
-                                display_bytes = img.tobytes()
+                                image = Image.frombytes("1", (250, 122), message)
+                                image = image.rotate(270, expand=True)
+                                if image.size != (122, 250):
+                                    image = image.resize((122, 250))
                                 print("[WSClient] Received 4000-byte image; enqueuing")
-                                # Enqueue for ordered, throttled refresh (protects e-paper)
-                                self._enqueue(display_bytes)
+                                self._enqueue(image.tobytes())
                             else:
-                                text = message.decode("utf-8", errors="ignore") if isinstance(message, bytes) else str(message)
+                                text = (
+                                    message.decode("utf-8", errors="ignore")
+                                    if isinstance(message, bytes)
+                                    else str(message)
+                                )
                                 if await self._handle_text_message(ws, text):
                                     continue
                                 print(f"[WSClient] Text message: {text}")
-                            
-                            # Check if connection is stale
-                            if time.time() - self._last_activity > self.CONNECTION_TIMEOUT:
-                                print("[WSClient] Connection appears dead (no activity for 60s)")
-                                break
                     finally:
                         ping_task.cancel()
-                        try:
-                            await ping_task
-                        except asyncio.CancelledError:
-                            pass
+                        await asyncio.gather(ping_task, return_exceptions=True)
+
+                except asyncio.CancelledError:
+                    raise
+                except ConnectionClosed as exc:
+                    print(f"[WSClient] Connection closed: {exc}")
+                except asyncio.TimeoutError:
+                    print("[WSClient] Connection timeout (network may be down)")
+                except OSError as exc:
+                    print(f"[WSClient] Network error: {exc}")
+                except Exception as exc:
+                    print(f"[WSClient] Error: {type(exc).__name__}: {exc}")
                 finally:
+                    connection_age = (
+                        time.monotonic() - connected_at if connected_at else 0.0
+                    )
                     self._connected = False
                     self._last_activity = 0.0
-                    await ws.close()
+                    self.connected.clear()
+                    self._ws = None
+                    if ws is not None:
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
 
-            except ConnectionClosed as e:
-                print(f"[WSClient] Connection closed: {e}, reconnecting in 5s...")
-            except asyncio.TimeoutError:
-                print("[WSClient] Connection timeout (network may be down), reconnecting in 5s...")
-            except OSError as e:
-                # Catch network errors like "Network is unreachable"
-                print(f"[WSClient] Network error: {e}, reconnecting in 5s...")
-            except Exception as e:
-                print(f"[WSClient] Error: {type(e).__name__}: {e}, reconnecting in 5s...")
+                if not self._running:
+                    break
+                if connection_age >= self.STABLE_CONNECTION_TIME:
+                    failure_count = 0
+                failure_count += 1
+                delay = self._reconnect_delay(failure_count)
+                print(
+                    f"[WSClient] Reconnect attempt {failure_count} in {delay:.1f}s"
+                )
+                await self._wait_for_retry(delay)
+        finally:
+            self._connected = False
+            self.connected.clear()
+            if self._refresh_task:
+                self._refresh_task.cancel()
+                await asyncio.gather(self._refresh_task, return_exceptions=True)
+                self._refresh_task = None
 
-            await asyncio.sleep(5)
+    def request_reconnect(self) -> None:
+        """Wake retry sleep and close a socket invalidated by network repair."""
+        self._reconnect_now.set()
+        if self._ws is not None:
+            try:
+                asyncio.create_task(self._ws.close())
+            except RuntimeError:
+                pass
 
     def stop(self):
         self._running = False
+        self._stop_event.set()
+        self.request_reconnect()
 
     def _enqueue(self, payload: bytes) -> None:
-        """Add a message to the ordered refresh queue with its reception timestamp."""
-        self._msg_queue.append({
-            "received_at": time.time(),
-            "payload": payload,
-            "shown": False,
-        })
+        if len(self._msg_queue) >= self.MAX_QUEUED_MESSAGES:
+            self._msg_queue.popleft()
+            print("[WSClient] Message queue full; discarded oldest pending message")
+        self._msg_queue.append(
+            {
+                "received_at": time.monotonic(),
+                "payload": payload,
+            }
+        )
         print(f"[WSClient] Message enqueued (queue size={len(self._msg_queue)})")
 
+    def _decorate_page1(self, payload: bytes) -> bytes:
+        if self.renderer is None:
+            return payload
+        return self.renderer.render_page1_status(payload, self.is_online())
+
     def _refresh_screen(self, payload: bytes) -> None:
-        """Update the cached image and physically refresh the screen if on Page 1."""
-        self._cached_image = payload
+        # Raw cloud bitmaps receive the same live footer as rendered text.
+        decorated = self._decorate_page1(payload)
+        self._cached_image = decorated
         if self.state.current_page == 1:
-            ok = self.display.send(payload)
+            ok = self.display.send(
+                decorated, page=1, online=self.is_online()
+            )
             print(f"[WSClient] Display refresh sent={ok}")
 
     async def _refresh_consumer(self) -> None:
-        """Poll the message queue and refresh the screen in strict reception order,
-        honoring the e-paper minimum safe refresh interval (MIN_REFRESH_INTERVAL).
-
-        Gate is based solely on LATEST_REFRESH_AT: if >= MIN_REFRESH_INTERVAL has
-        passed since the last refresh, the head message is shown immediately
-        regardless of its own reception timestamp.
-        """
         while self._running:
             await asyncio.sleep(self.REFRESH_POLL_INTERVAL)
             if not self._msg_queue:
                 continue
-            elapsed = time.time() - self._latest_refresh_at
-            if elapsed >= self.MIN_REFRESH_INTERVAL:
-                # Dequeue head, refresh, and record the refresh timestamp
-                item = self._msg_queue.popleft()
-                self._refresh_screen(item["payload"])
-                item["shown"] = True
-                self._latest_refresh_at = time.time()
-                print(
-                    f"[WSClient] Refreshed queued message "
-                    f"(waited {time.time() - item['received_at']:.0f}s, "
-                    f"queue remaining={len(self._msg_queue)})"
-                )
-            # else: too soon since last refresh; retry on the next polling cycle
+            elapsed = time.monotonic() - self._latest_refresh_at
+            if elapsed < self.MIN_REFRESH_INTERVAL:
+                continue
+            # Do not collide with a touch or status refresh already being
+            # processed by the e-paper driver. Keep the queue head pending.
+            if self.state.current_page == 1 and not self.display.can_refresh:
+                continue
+
+            item = self._msg_queue.popleft()
+            self._refresh_screen(item["payload"])
+            self._latest_refresh_at = time.monotonic()
+            print(
+                f"[WSClient] Refreshed queued message "
+                f"(waited {time.monotonic() - item['received_at']:.0f}s, "
+                f"queue remaining={len(self._msg_queue)})"
+            )
 
     async def _handle_text_message(self, ws, text: str) -> bool:
         try:
@@ -220,7 +279,6 @@ class WSClient:
             print("[WSClient] Ping received; pong sent")
             return True
 
-        # New format: check if epaper is in targets array
         targets = data.get("targets", [])
         if "epaper" not in targets:
             return False
@@ -232,17 +290,15 @@ class WSClient:
             if self.renderer is None:
                 print("[WSClient] Message received, but renderer is unavailable")
                 return True
-
-            img = self.renderer.render_page1_message(str(title), str(content))
-            print(f"[WSClient] Message rendered title={str(title)[:32]!r}; enqueuing")
-            # Enqueue for ordered, throttled refresh (protects e-paper)
-            self._enqueue(img)
+            image = self.renderer.render_page1_message(str(title), str(content))
+            print(
+                f"[WSClient] Message rendered title={str(title)[:32]!r}; enqueuing"
+            )
+            self._enqueue(image)
             return True
-
         return False
 
     def is_online(self) -> bool:
-        """Return True if the WebSocket connection is up and healthy."""
         if not self._connected:
             return False
-        return time.time() - self._last_activity <= self.CONNECTION_TIMEOUT
+        return time.monotonic() - self._last_activity <= self.CONNECTION_TIMEOUT

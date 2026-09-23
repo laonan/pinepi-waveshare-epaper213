@@ -155,12 +155,23 @@ Set the `wss_url` and `auth_token` in the device config to match your deployed s
 
 ---
 
-## Wi-Fi Notes
+## Wi-Fi Reliability
 
-If you plan to keep the device powered on for extended periods, run the command below. The Wi-Fi on the Raspberry Pi Zero is prone to unstable connections.
+The service now applies Raspberry Pi Zero reliability settings automatically:
+
+- NetworkManager station profiles use autoconnect with unlimited retries.
+- Wi-Fi power saving is disabled at runtime and persisted per profile.
+- Health requires the configured SSID, an activated NetworkManager device, IPv4, and a default route; a retained/stale address alone is not accepted.
+- Failed recovery uses bounded exponential backoff with jitter (up to five minutes), with a radio reset every third failed attempt.
+- A configured device waits ten minutes before falling back to AP mode, avoiding AP/station contention during transient router or DHCP outages. Station probes from AP mode preserve a two-minute AP availability window.
+
+The bottom-right `ONLINE`/`OFFLINE` label represents the cloud WebSocket connection, not merely Wi-Fi association. Status changes are queued until the e-paper refresh completes and do not require changing pages.
+
+For diagnostics on a device:
 
 ```bash
-sudo iw dev wlan0 set power_save off
+sudo journalctl -u pinepi-waveshare-epaper213 --since today
+sudo journalctl -u NetworkManager --since today
 ```
 
 ---
@@ -170,7 +181,7 @@ sudo iw dev wlan0 set power_save off
 1. **C Process Crash Auto-Restart**: Python built-in watchdog, `poll()` detects C process status, auto-spawns new process within 2 seconds.
 2. **GT_Scan Thread Safety**: All touch scans execute only in main thread; UDS receive thread only delivers refresh flags, avoiding race on `Dev_Now`.
 3. **Flush Touch Cache After Refresh**: After each screen refresh, continuously read GT1151 chip 10 times to discard ghost touch data generated during e-paper refresh jitter.
-4. **AP Mode Smart Fallback**: Python background coroutine checks LAN IP availability every 15 seconds, auto-enables hotspot when no usable LAN IP is detected, auto-disables hotspot when a valid LAN IP is obtained.
+4. **AP Mode Delayed Fallback**: NetworkManager owns normal station autoconnect. The supervisor retries confirmed link/DHCP failures with jitter and only enables the single-radio hotspot after a sustained outage, preventing transient renewals from forcing AP mode.
 
 ---
 

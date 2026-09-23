@@ -1,6 +1,6 @@
 import subprocess
-import time
-from flask import Flask, request, render_template_string, jsonify
+import threading
+from flask import Flask, request, render_template_string
 from werkzeug.serving import make_server
 
 HTML_INDEX = """
@@ -128,6 +128,8 @@ class WebServer:
         self.port = port
         self.app = self._create_app()
         self._server = make_server("0.0.0.0", port, self.app, threaded=True)
+        self._server.timeout = 0.5
+        self._shutdown_requested = threading.Event()
 
     def _create_app(self):
         app = Flask(__name__)
@@ -156,34 +158,19 @@ class WebServer:
                 if ssid:
                     networks.append({"ssid": ssid, "password": pwd})
 
-            self.config.wifi_networks = networks
-            self.config.wss_url = request.form.get("wss_url", "").strip()
-            self.config.auth_token = request.form.get("token", "").strip()
+            token = request.form.get("token", "").strip()
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            self.config.update(
+                wifi_networks=networks,
+                wss_url=request.form.get("wss_url", "").strip(),
+                auth_token=token,
+            )
 
-            # Try switching back to Station mode and connect
-            self.nm.stop_ap()
-            time.sleep(1)  # Wait for AP to fully stop
-
-            # Check if we need to switch Wi-Fi networks
-            ok = False
-            if networks:
-                current_ssid = self.nm.get_current_wifi_ssid()
-                target_ssid = networks[0].get("ssid", "").strip()
-
-                if current_ssid == target_ssid:
-                    # Already on correct network, just verify connection
-                    print(f"[WebServer] Already connected to target SSID: {target_ssid}")
-                    ok = True
-                elif current_ssid:
-                    # Connected to wrong network - need to disconnect first
-                    print(f"[WebServer] Connected to {current_ssid}, need to switch to {target_ssid}")
-                    self.nm.disconnect_wifi()
-                    time.sleep(2)  # Wait for disconnect
-                    ok = self.nm.connect_wifi(target_ssid, networks[0].get("password", ""))
-                else:
-                    # Not connected, try to connect to primary network
-                    print(f"[WebServer] Not connected, attempting to connect to {target_ssid}")
-                    ok = self.nm.ensure_best_wifi(networks)
+            # Apply all radio changes under NetworkManager's shared mutation
+            # lock. This prevents the background recovery loop and Flask worker
+            # from issuing conflicting station/AP commands.
+            ok = self.nm.apply_wifi_configuration(networks) if networks else False
 
             # Restart service to apply WSS settings
             print("[WebServer] Restarting service to apply new configuration...")
@@ -268,8 +255,13 @@ class WebServer:
         return app
 
     def run(self):
+        if self._shutdown_requested.is_set():
+            return
         print(f"[WebServer] Starting on 0.0.0.0:{self.port}")
-        self._server.serve_forever()
+        # A short handle_request loop makes shutdown safe even if SIGTERM
+        # arrives before the server thread enters its serving loop.
+        while not self._shutdown_requested.is_set():
+            self._server.handle_request()
 
     def shutdown(self):
-        self._server.shutdown()
+        self._shutdown_requested.set()

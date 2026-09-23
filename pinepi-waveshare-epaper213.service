@@ -1,6 +1,7 @@
 [Unit]
 Description=PinePi Core & Display Service
-After=network.target
+Wants=NetworkManager.service
+After=NetworkManager.service network.target
 
 [Service]
 Type=simple

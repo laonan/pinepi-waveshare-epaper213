@@ -1,13 +1,23 @@
 import asyncio
 import json
-import socket
 import os
+import socket
 import time
 
-class TouchListener:
-    """Touch event listener supporting both UDS and legacy UDP protocols"""
 
-    def __init__(self, socket_path: str, state_machine, display_client, renderer, ws_client, network_manager=None, udp_port: int = 5006):
+class TouchListener:
+    """Touch event listener supporting both UDS and legacy UDP protocols."""
+
+    def __init__(
+        self,
+        socket_path: str,
+        state_machine,
+        display_client,
+        renderer,
+        ws_client,
+        network_manager=None,
+        udp_port: int = 5006,
+    ):
         self.socket_path = socket_path
         self.state = state_machine
         self.display = display_client
@@ -15,23 +25,21 @@ class TouchListener:
         self.ws = ws_client
         self.nm = network_manager
         self.udp_port = udp_port
-        self._last_tap_ts = 0
+        self._last_tap_ts = 0.0
+        self._tap_lock = asyncio.Lock()
 
     async def run(self):
         uds_sock = self._create_uds_socket()
         udp_sock = self._create_udp_socket()
-
         if uds_sock is None and udp_sock is None:
             print("[TouchListener] No touch socket available, exiting touch listener")
             return
 
         loop = asyncio.get_running_loop()
         tasks = []
-
         if uds_sock is not None:
             print(f"[TouchListener] Listening on UDS {self.socket_path}")
             tasks.append(asyncio.create_task(self._uds_loop(loop, uds_sock)))
-
         if udp_sock is not None:
             print(f"[TouchListener] Listening on UDP 0.0.0.0:{self.udp_port}")
             tasks.append(asyncio.create_task(self._udp_loop(loop, udp_sock)))
@@ -39,6 +47,9 @@ class TouchListener:
         try:
             await asyncio.gather(*tasks)
         finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             if uds_sock is not None:
                 uds_sock.close()
             if udp_sock is not None:
@@ -50,13 +61,12 @@ class TouchListener:
                 os.unlink(self.socket_path)
             except FileNotFoundError:
                 pass
-
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             sock.bind(self.socket_path)
             sock.setblocking(False)
             return sock
-        except Exception as e:
-            print(f"[TouchListener] UDS socket unavailable: {e}")
+        except Exception as exc:
+            print(f"[TouchListener] UDS socket unavailable: {exc}")
             return None
 
     def _create_udp_socket(self):
@@ -66,17 +76,19 @@ class TouchListener:
             sock.bind(("0.0.0.0", self.udp_port))
             sock.setblocking(False)
             return sock
-        except Exception as e:
-            print(f"[TouchListener] UDP socket unavailable: {e}")
+        except Exception as exc:
+            print(f"[TouchListener] UDP socket unavailable: {exc}")
             return None
 
     async def _uds_loop(self, loop, sock):
         while True:
             try:
-                data, addr = await loop.sock_recvfrom(sock, 1024)
+                data, _ = await loop.sock_recvfrom(sock, 1024)
                 await self._process_raw_message(data)
-            except Exception as e:
-                print(f"[TouchListener] UDS receive error: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[TouchListener] UDS receive error: {exc}")
                 await asyncio.sleep(0.1)
 
     async def _udp_loop(self, loop, sock):
@@ -84,91 +96,112 @@ class TouchListener:
             try:
                 data, addr = await loop.sock_recvfrom(sock, 1024)
                 await self._process_raw_message(data, addr)
-            except Exception as e:
-                print(f"[TouchListener] UDP receive error: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[TouchListener] UDP receive error: {exc}")
                 await asyncio.sleep(0.1)
 
     async def _process_raw_message(self, data: bytes, addr=None):
-        msg = data.decode("utf-8", errors="ignore").strip()
-        if msg == "TAP":
-            print(f"[TouchListener] TAP received (legacy UDP){' from ' + str(addr) if addr else ''}")
-            self._handle_tap()
+        message = data.decode("utf-8", errors="ignore").strip()
+        if message == "TAP":
+            suffix = f" from {addr}" if addr else ""
+            print(f"[TouchListener] TAP received (legacy UDP){suffix}")
+            await self._handle_tap()
             return
 
         try:
-            event = json.loads(msg)
+            event = json.loads(message)
             if event.get("type") == "tap":
-                ts = event.get("ts", 0)
-                print(f"[TouchListener] TAP received (ts={ts})")
-                self._handle_tap()
+                print(f"[TouchListener] TAP received (ts={event.get('ts', 0)})")
+                await self._handle_tap()
                 return
         except json.JSONDecodeError:
             pass
+        print(f"[TouchListener] Invalid touch payload: {message}")
 
-        print(f"[TouchListener] Invalid touch payload: {msg}")
+    async def _handle_tap(self):
+        async with self._tap_lock:
+            now = time.monotonic()
+            if now - self._last_tap_ts < 0.3:
+                return
+            self._last_tap_ts = now
+            new_page = self.state.next_page()
+            _, generation = self.state.page_snapshot()
+            print(f"[TouchListener] Switch to page {new_page}")
+            self.state.begin_render()
+            try:
+                await self._dispatch_page(new_page, generation)
+            finally:
+                self.state.end_render()
 
-    def _handle_tap(self):
-        now_ms = int(time.time() * 1000)
-        if now_ms - self._last_tap_ts < 300:
-            return
-        self._last_tap_ts = now_ms
-        new_page = self.state.next_page()
-        print(f"[TouchListener] Switch to page {new_page}")
-        self._dispatch_page(new_page)
-
-    def _dispatch_page(self, page: int):
+    async def _dispatch_page(self, page: int, generation: int):
         sent = False
         if page == 1:
-            # Page 1: Cloud dashboard - send latest cached cloud image, or show default/offline page if no cache
-            img = self.ws.get_cached_image()
-            if img:
-                # Cached message bitmaps contain the footer from the time they
-                # were rendered. Refresh that footer when returning to Page 1
-                # so a status change while viewing another page is reflected.
-                img = self.renderer.render_page1_status(img, self.ws.is_online())
-                sent = self.display.send(img)
+            online = self.ws.is_online()
+            image = self.ws.get_cached_image()
+            if image:
+                image = self.renderer.render_page1_status(image, online)
             else:
-                img = self.renderer.render_page1(is_offline=not self.ws.is_online())
-                sent = self.display.send(img)
+                image = self.renderer.render_page1(is_offline=not online)
+            sent = self.state.is_current(page, generation) and self.display.send(
+                image, page=1, online=online
+            )
+
         elif page == 2:
-            # Page 2: Local system monitor
-            img = self.renderer.render_page2()
-            sent = self.display.send(img)
+            online = self.ws.is_online()
+            image = self.renderer.render_page2()
+            sent = self.state.is_current(page, generation) and self.display.send(
+                image, page=2, online=online
+            )
+
         elif page == 3:
-            # Page 3: Config page QR code
             print("[TouchListener] Entering Page 3 (network config)")
             net_state = None
             if self.nm:
-                # Use unified network state for consistent behavior
-                net_state = self.nm.get_network_state()
-                if net_state["lan_ip"]:
-                    print(f"[TouchListener] Page 3: detected LAN IP {net_state['lan_ip']}")
-                    # If LAN IP available but AP is active, stop AP immediately
+                # NetworkManager calls can take tens of seconds while DHCP is
+                # broken. Keep them off the asyncio loop so WSS ping/pong and
+                # the status footer continue to run.
+                net_state = await asyncio.to_thread(self.nm.get_network_state)
+                if net_state["station_healthy"]:
+                    print(
+                        f"[TouchListener] Page 3: healthy station "
+                        f"{net_state['wifi_ssid']} at {net_state['lan_ip']}"
+                    )
                     if net_state["ap_active"]:
-                        print("[TouchListener] Page 3: stopping AP (LAN IP available)")
-                        self.nm.stop_ap()
+                        print("[TouchListener] Page 3: stopping AP (LAN available)")
+                        await asyncio.to_thread(
+                            self.nm.stop_ap_if_station_available
+                        )
+                        net_state = await asyncio.to_thread(
+                            self.nm.get_network_state
+                        )
                 elif net_state["ap_active"]:
-                    print(f"[TouchListener] Page 3: AP is already active (SSID: {net_state['ap_ssid']})")
+                    print(
+                        f"[TouchListener] Page 3: AP already active "
+                        f"(SSID: {net_state['ap_ssid']})"
+                    )
                 else:
-                    # No usable LAN IP and AP not active - start AP immediately
-                    print("[TouchListener] Page 3: no usable LAN IP, starting AP now...")
-                    ap_started = self.nm.create_ap()
-                    if ap_started:
-                        # Re-check state after starting AP
-                        net_state = self.nm.get_network_state()
-                        if net_state["ap_active"]:
-                            print("[TouchListener] Page 3: AP started successfully")
-                        else:
-                            print("[TouchListener] Page 3: AP start reported success but not confirmed active")
-                    else:
-                        print("[TouchListener] Page 3: AP failed to start")
-                img = self.renderer.render_page3_with_state(net_state)
+                    print("[TouchListener] Page 3: no LAN; starting AP")
+                    await asyncio.to_thread(
+                        self.nm.start_ap_if_unavailable
+                    )
+                    net_state = await asyncio.to_thread(
+                        self.nm.get_network_state
+                    )
+                image = self.renderer.render_page3_with_state(net_state)
             else:
-                # Fallback to legacy method if no network manager
-                print("[TouchListener] Page 3: no NetworkManager, using legacy render")
-                img = self.renderer.render_page3()
-            sent = self.display.send(img)
+                print("[TouchListener] No NetworkManager; using legacy Page 3")
+                image = self.renderer.render_page3()
+            sent = self.state.is_current(page, generation) and self.display.send(
+                image, page=3, online=self.ws.is_online()
+            )
             if net_state:
-                print(f"[TouchListener] Page 3 rendered: mode={net_state.get('mode', 'unknown')}, "
-                      f"lan_ip={net_state.get('lan_ip')}, ap_active={net_state.get('ap_active')}")
+                print(
+                    f"[TouchListener] Page 3 rendered: "
+                    f"mode={net_state.get('mode', 'unknown')}, "
+                    f"lan_ip={net_state.get('lan_ip')}, "
+                    f"ap_active={net_state.get('ap_active')}"
+                )
+
         print(f"[TouchListener] Page {page} dispatch sent={sent}")

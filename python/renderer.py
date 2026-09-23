@@ -151,24 +151,30 @@ class Renderer:
         self._draw_footer(draw, "Page: 1/3 (Cloud)")
         return self._to_display_bytes(img)
 
-    def render_page1_status(self, display_bytes: bytes, online: bool) -> bytes:
-        """Update only the Page 1 footer while preserving the displayed message.
+    def render_footer_status(
+        self, display_bytes: bytes, footer_text: str, online: bool
+    ) -> bytes:
+        """Redraw a footer while preserving the current page contents.
 
-        Cached cloud images are already in portrait/display orientation. Rotate
-        them back to the renderer's landscape canvas, redraw the footer, and
-        convert them back so a connectivity change does not require the message
-        payload to be received again.
+        Display frames are portrait-oriented. Rotate back to the renderer's
+        landscape canvas, replace the footer strip, then restore display
+        orientation. This lets every page reflect a cloud-state transition
+        without rerunning slow network/system probes.
         """
         if len(display_bytes) != 4000:
             return display_bytes
 
         img = Image.frombytes("1", (122, 250), display_bytes).rotate(90, expand=True)
         draw = ImageDraw.Draw(img)
-        # Clear the old footer before drawing the new status. This also handles
-        # ONLINE -> OFFLINE, where the label becomes wider.
         draw.rectangle((0, 108, self.CANVAS_W, self.CANVAS_H), fill=255)
-        self._draw_footer(draw, "Page: 1/3 (Cloud)", online=online)
+        self._draw_footer(draw, footer_text, online=online)
         return self._to_display_bytes(img)
+
+    def render_page1_status(self, display_bytes: bytes, online: bool) -> bytes:
+        """Compatibility wrapper for updating the Cloud page footer."""
+        return self.render_footer_status(
+            display_bytes, "Page: 1/3 (Cloud)", online
+        )
 
     # ------------------------------------------------------------------
     # Page 2: System Monitor

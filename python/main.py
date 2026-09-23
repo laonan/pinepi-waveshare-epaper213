@@ -1,42 +1,62 @@
 import asyncio
 import datetime
 import os
+import random
 import signal
 import subprocess
 import sys
 import time
 
-from PIL import ImageDraw
-
 from config import Config
-from state_machine import StateMachine
 from display_client import DisplayClient
-from touch_listener import TouchListener
-from renderer import Renderer
 from network_manager import NetworkManager
-from ws_client import WSClient
+from renderer import Renderer
+from state_machine import StateMachine
+from touch_listener import TouchListener
 from web_server import WebServer
+from ws_client import WSClient
 
-# ---------------------------------------------------------------------------
-# Config paths
-# ---------------------------------------------------------------------------
-CONFIG_PATH = os.environ.get("PINEPI_CONFIG", "/etc/pinepi-waveshare-epaper213/config.json")
-DISPLAY_BIN = os.environ.get("PINEPI_DISPLAY", "/opt/pinepi-waveshare-epaper213/bin/pinepi-waveshare-epaper213")
 
-# ---------------------------------------------------------------------------
-# Globals for signal handling
-# ---------------------------------------------------------------------------
+CONFIG_PATH = os.environ.get(
+    "PINEPI_CONFIG", "/etc/pinepi-waveshare-epaper213/config.json"
+)
+DISPLAY_BIN = os.environ.get(
+    "PINEPI_DISPLAY",
+    "/opt/pinepi-waveshare-epaper213/bin/pinepi-waveshare-epaper213",
+)
+
+NETWORK_POLL_INTERVAL = 15
+LINK_FAILURE_CONFIRMATION = 30
+AP_STATION_RETRY_CONFIRMATION = 120
+INTERNET_FAILURE_CONFIRMATION = 300
+STABLE_CONNECTION_RESET = 120
+CONFIGURED_AP_FALLBACK_DELAY = 600
+UNCONFIGURED_AP_FALLBACK_DELAY = 30
+RECONNECT_BASE_DELAY = 5
+RECONNECT_MAX_DELAY = 300
+
+PAGE_FOOTERS = {
+    1: "Page: 1/3 (Cloud)",
+    2: "Page: 2/3 (Local)",
+    3: "Page: 3/3 (Config)",
+}
+
+
 g_loop = None
 g_tasks = []
 g_ws_client = None
+g_web_server = None
+g_network_manager = None
+g_shutting_down = False
 
 
 def _kill_old_display():
-    """Kill any existing C display process before starting"""
+    """Kill any stale C display process before starting a fresh one."""
     try:
         subprocess.run(
             ["pkill", "-9", "-f", DISPLAY_BIN],
-            stderr=subprocess.DEVNULL, timeout=5
+            stderr=subprocess.DEVNULL,
+            timeout=5,
         )
         time.sleep(0.5)
     except Exception:
@@ -44,9 +64,8 @@ def _kill_old_display():
 
 
 def start_display_process():
-    """Start C display process via subprocess with separate session to avoid signal propagation"""
     print(f"[Main] Starting display process: {DISPLAY_BIN}")
-    proc = subprocess.Popen(
+    return subprocess.Popen(
         [DISPLAY_BIN],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -54,28 +73,23 @@ def start_display_process():
         bufsize=1,
         universal_newlines=True,
     )
-    return proc
 
 
 async def monitor_display(proc, restart_event: asyncio.Event):
-    """Watchdog: monitor C process stdout and restart on crash"""
+    """Forward C process logs and request a restart if it exits."""
     loop = asyncio.get_running_loop()
-
     while True:
         try:
             line = await loop.run_in_executor(None, proc.stdout.readline)
         except Exception:
             line = ""
-
         if line:
             print(f"[Display] {line.rstrip()}")
             continue
-
         ret = proc.poll()
         if ret is None:
             await asyncio.sleep(0.1)
             continue
-
         print(f"[Watchdog] Display exited with code {ret}, restarting in 2s...")
         await asyncio.sleep(2)
         restart_event.set()
@@ -83,17 +97,14 @@ async def monitor_display(proc, restart_event: asyncio.Event):
 
 
 async def display_watchdog(restart_event: asyncio.Event, start_fn):
-    """Outer watchdog loop responsible for spawning new processes"""
     while True:
         await restart_event.wait()
         restart_event.clear()
         proc = start_fn()
-        # Hand off new process to monitor_display for continued monitoring
         asyncio.create_task(monitor_display(proc, restart_event))
 
 
 async def wait_until(hour: int, minute: int):
-    """Sleep until the next occurrence of hour:minute today (or tomorrow)."""
     now = datetime.datetime.now()
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if target <= now:
@@ -101,208 +112,393 @@ async def wait_until(hour: int, minute: int):
     await asyncio.sleep((target - now).total_seconds())
 
 
-async def keep_alive_loop(state, display, renderer, ws, network_manager):
-    """Trigger full refresh daily at 03:00 to prevent e-paper screen burn-in
-    Also monitor WebSocket health every 5 minutes"""
-    last_ws_check = 0
-    WS_CHECK_INTERVAL = 300  # 5 minutes
-    
+def _reconnect_delay(failure_count: int) -> float:
+    """Equal-jitter exponential backoff for station recovery attempts."""
+    exponent = min(max(failure_count - 1, 0), 10)
+    ceiling = min(RECONNECT_MAX_DELAY, RECONNECT_BASE_DELAY * (2 ** exponent))
+    return random.uniform(ceiling / 2, ceiling)
+
+
+def _page3_signature(net_state: dict):
+    return (
+        net_state.get("mode"),
+        net_state.get("lan_ip"),
+        net_state.get("ap_active"),
+        net_state.get("ap_ip"),
+    )
+
+
+async def status_display_loop(
+    state, display, renderer, ws, network_manager
+):
+    """Keep the visible frame synchronized with live cloud connectivity.
+
+    DisplayClient metadata changes only after a frame is accepted, so failed
+    navigation sends and busy periods remain pending instead of being
+    optimistically acknowledged.
+    """
     while True:
-        # Check WebSocket health every 5 minutes
-        current_time = time.time()
-        if current_time - last_ws_check >= WS_CHECK_INTERVAL:
-            last_ws_check = current_time
-            print("[KeepAlive] Checking WebSocket health...")
-            if ws._running and network_manager.is_online():
-                # If we're online but no recent WebSocket activity, it might be stuck
-                cached_img = ws.get_cached_image()
-                if not cached_img:
-                    print("[KeepAlive] WARNING: WebSocket appears stuck (no cached image)")
-                    # The ws.run() task should handle reconnection automatically
+        await asyncio.sleep(1)
+        page, generation = state.page_snapshot()
+        online = ws.is_online()
+        displayed_page, displayed_online, _ = display.last_frame_info
+
+        if state.render_in_progress:
+            continue
+        if displayed_page != page:
+            if not display.can_refresh:
+                continue
+            if page == 1:
+                image = ws.get_cached_image()
+                if image:
+                    image = renderer.render_page1_status(image, online)
+                else:
+                    image = renderer.render_page1(is_offline=not online)
+            elif page == 2:
+                image = await asyncio.to_thread(renderer.render_page2)
+            elif page == 3:
+                net_state = await asyncio.to_thread(
+                    network_manager.get_network_state
+                )
+                image = renderer.render_page3_with_state(net_state)
             else:
-                print(f"[KeepAlive] WebSocket status: running={ws._running}, online={network_manager.is_online()}")
-        
-        # Wait until 03:00 for daily refresh
-        await wait_until(3, 0)  # Daily at 03:00
-        print("[KeepAlive] Daily refresh at 03:00 to prevent screen burn-in")
+                continue
+            if (
+                not state.is_current(page, generation)
+                or state.render_in_progress
+                or not display.can_refresh
+            ):
+                continue
+            if display.send(image, page=page, online=online):
+                print(f"[StatusDisplay] Recovered missing Page {page} frame")
+            continue
 
-        page = state.current_page
-        img = None
-        if page == 1:
-            img = ws.get_cached_image()
-            if not img or len(img) != 4000:
-                is_online = network_manager.is_online()
-                img = renderer.render_page1(is_offline=not is_online)
-        elif page == 2:
-            img = renderer.render_page2()
-        elif page == 3:
-            # Use unified network state for consistent Page 3 rendering
-            net_state = network_manager.get_network_state()
-            img = renderer.render_page3_with_state(net_state)
+        if displayed_online == online or not display.can_refresh:
+            continue
 
-        if not img or len(img) != 4000:
-            # Fallback: blank white image (4000 bytes of 0xFF)
-            img = b'\xff' * 4000
-
-        display.send(img)
-
-
-async def network_loop(config, network_manager, state_machine, display, renderer, ws):
-    """Background coroutine: check network status periodically, auto-switch to AP when no usable LAN IP, ensure Station mode when LAN IP available.
-    Designed to be non-intrusive with netplan-managed connections."""
-    ap_active = False
-    last_mode = None  # "lan" | "ap" | None
-    last_wifi_reconnect_attempt = 0  # Track last reconnection attempt time
-    WIFI_RECONNECT_INTERVAL = 300  # 5 minutes between reconnection attempts (was 60s, too aggressive)
-    DHCP_GRACE_PERIOD = 60  # Time to wait for DHCP after detecting an active Wi-Fi association
-    lan_ip_missing_count = 0  # Track consecutive missing LAN IP checks
-    LAN_IP_MISSING_THRESHOLD = 3  # Require 3 consecutive failures (45 seconds) before triggering AP mode
-    grace_period_end = 0  # Grace period after reconnection to avoid flip-flopping
-    last_displayed_ws_online = ws.is_online()
-
-    while True:
-        ws_online = ws.is_online()
-        # The footer is part of the e-paper bitmap, so changing the underlying
-        # WebSocket state alone is not enough. Redraw Page 1 when the state
-        # changes, even if no new cloud message arrives.
-        if ws_online != last_displayed_ws_online and state_machine.current_page == 1 and display.can_refresh:
-            cached_img = ws.get_cached_image()
-            if cached_img:
-                img = renderer.render_page1_status(cached_img, ws_online)
-            else:
-                img = renderer.render_page1(is_offline=not ws_online)
-            if display.send(img):
-                last_displayed_ws_online = ws_online
-                print(f"[NetworkLoop] Page 1 footer updated: {'ONLINE' if ws_online else 'OFFLINE'}")
-
-        # Get unified network state
-        net_state = network_manager.get_network_state()
-        has_lan_ip = net_state["lan_ip"] is not None
-        mode = net_state["mode"]
-        ap_active = net_state["ap_active"]
-        current_time = time.time()
-        in_grace_period = current_time < grace_period_end
-
-        # Log state changes
-        if mode != last_mode:
-            if mode == "lan":
-                print(f"[NetworkLoop] Mode change: LAN config mode (IP: {net_state['lan_ip']})")
-            elif mode == "ap":
-                print(f"[NetworkLoop] Mode change: AP config mode (SSID: {net_state['ap_ssid']})")
-            else:
-                print(f"[NetworkLoop] Mode change: Unavailable (no LAN IP, AP not active)")
-            last_mode = mode
-
-        # Decision: should AP be active?
-        # AP should be active when there's no usable LAN IP - but with debouncing
-        # to avoid triggering on transient DHCP renewal glitches
-        if has_lan_ip:
-            lan_ip_missing_count = 0  # Reset counter on successful detection
-            # If we recently reconnected, extend grace period
-            if in_grace_period:
-                grace_period_end = current_time + 30  # Extend grace period
+        if page == 1 and not ws.get_cached_image():
+            image = renderer.render_page1(is_offline=not online)
         else:
-            # Do not count DHCP wait time as an AP fallback signal. Without this,
-            # a Pi that is associated but still waiting for DHCP can be forced
-            # back into AP mode before the grace period expires.
-            if not in_grace_period:
-                lan_ip_missing_count += 1
+            image = display.last_image
+            footer = PAGE_FOOTERS.get(page)
+            if len(image) != 4000 or footer is None:
+                continue
+            image = renderer.render_footer_status(image, footer, online)
 
-        # When no LAN IP detected, try to reconnect - but only if grace period passed
-        if not has_lan_ip and not in_grace_period and lan_ip_missing_count >= LAN_IP_MISSING_THRESHOLD - 1:
-            if current_time - last_wifi_reconnect_attempt >= WIFI_RECONNECT_INTERVAL:
-                if config.wifi_networks:
-                    mode_str = "AP mode" if ap_active else "Station mode (no IP)"
-                    print(f"[NetworkLoop] In {mode_str}, attempting Wi-Fi reconnection...")
-                    print(f"[NetworkLoop] NOTE: Using non-intrusive method for netplan compatibility")
-                    # Use lightweight check first - don't disconnect if already associated
-                    current_ssid = network_manager.get_current_wifi_ssid()
-                    if current_ssid:
-                        print(f"[NetworkLoop] Already associated with {current_ssid}, waiting for DHCP...")
-                        # Give DHCP more time before attempting reconnection
-                        grace_period_end = current_time + DHCP_GRACE_PERIOD
-                        lan_ip_missing_count = 0
-                        in_grace_period = True
-                    else:
-                        reconnected = network_manager.ensure_best_wifi(config.wifi_networks)
-                        if reconnected:
-                            print("[NetworkLoop] Wi-Fi reconnected! 5-minute grace period starting.")
-                            grace_period_end = current_time + 300  # 5-minute grace period
-                            in_grace_period = True
-                            net_state = network_manager.get_network_state()
-                            has_lan_ip = net_state["lan_ip"] is not None
-                            ap_active = net_state["ap_active"]
-                            lan_ip_missing_count = 0
-                        else:
-                            print("[NetworkLoop] Wi-Fi reconnection failed, will retry in 5 minutes")
-                    last_wifi_reconnect_attempt = current_time
-                else:
-                    last_wifi_reconnect_attempt = current_time
+        if display.send(image, page=page, online=online):
+            print(
+                f"[StatusDisplay] Page {page} footer updated: "
+                f"{'ONLINE' if online else 'OFFLINE'}"
+            )
 
-        # Only trigger AP mode after sustained absence of LAN IP and outside
-        # any DHCP/reconnect grace period. This prevents flip-flopping during
-        # DHCP renewals (~70 second outages observed).
-        should_ap_be_active = (
-            not has_lan_ip
-            and not in_grace_period
-            and lan_ip_missing_count >= LAN_IP_MISSING_THRESHOLD
-        )
 
-        if should_ap_be_active and not ap_active:
-            print("[NetworkLoop] No usable LAN IP -> starting AP mode")
-            ap_started = network_manager.create_ap()
-            if ap_started:
-                # Verify AP actually started
-                await asyncio.sleep(1)  # Give nmcli time to activate
-                ap_is_active = network_manager.is_ap_active()
-                if ap_is_active:
-                    ap_active = True
-                    print("[NetworkLoop] AP mode confirmed active")
-                else:
-                    print("[NetworkLoop] AP start reported success but AP is not active, will retry")
-                net_state = network_manager.get_network_state()
+async def daily_refresh_loop(state, display, renderer, ws, network_manager):
+    """Perform the existing daily e-paper refresh independently of health checks."""
+    while True:
+        await wait_until(3, 0)
+        print("[DailyRefresh] Refreshing the current page at 03:00")
+        page, generation = state.page_snapshot()
+        if page == 1:
+            image = ws.get_cached_image()
+            if image:
+                image = renderer.render_page1_status(image, ws.is_online())
             else:
-                print("[NetworkLoop] AP mode failed to start, will retry")
-                net_state = network_manager.get_network_state()
+                image = renderer.render_page1(is_offline=not ws.is_online())
+        elif page == 2:
+            image = renderer.render_page2()
+        elif page == 3:
+            net_state = await asyncio.to_thread(network_manager.get_network_state)
+            image = renderer.render_page3_with_state(net_state)
+        else:
+            image = b"\xff" * 4000
 
-            # Refresh Page 3 if needed (skip if display is busy from user interaction)
-            if state_machine.current_page == 3 and display.can_refresh:
-                img = renderer.render_page3_with_state(net_state)
-                display.send(img)
+        if len(image) != 4000:
+            image = b"\xff" * 4000
+        if (
+            not state.is_current(page, generation)
+            or state.render_in_progress
+            or not display.can_refresh
+        ):
+            print("[DailyRefresh] Skipped because a newer frame is active")
+            continue
+        display.send(image, page=page, online=ws.is_online())
 
-        elif has_lan_ip and ap_active:
-            print("[NetworkLoop] Usable LAN IP available -> stopping AP mode")
-            ap_stopped = network_manager.stop_ap()
-            if ap_stopped:
-                ap_active = False
-                print("[NetworkLoop] AP mode stopped")
+
+async def network_loop(
+    config, network_manager, state_machine, display, renderer, ws
+):
+    """Supervise station recovery without blocking touch or WebSocket tasks."""
+    await asyncio.to_thread(
+        network_manager.configure_wifi_reliability, config.wifi_networks
+    )
+
+    link_unhealthy_since = None
+    internet_unhealthy_since = None
+    stable_since = None
+    next_reconnect_at = 0.0
+    reconnect_failures = 0
+    ap_retry_at = 0.0
+    ap_active_since = None
+    last_logged_signature = None
+    observed_page3_signature = None
+    pending_page3_state = None
+
+    while True:
+        try:
+            net_state = await asyncio.to_thread(network_manager.get_network_state)
+            now = time.monotonic()
+            station_healthy = bool(net_state.get("station_healthy"))
+            ap_active = bool(net_state.get("ap_active"))
+            connectivity = net_state.get("connectivity", "unknown")
+            ws_online = ws.is_online()
+            networks = config.wifi_networks
+
+            if ap_active:
+                ap_active_since = (
+                    net_state.get("ap_activated_at")
+                    or ap_active_since
+                    or now
+                )
             else:
-                print("[NetworkLoop] AP stop failed, will retry")
-            net_state = network_manager.get_network_state()
+                ap_active_since = None
 
-            # Refresh Page 3 if needed (skip if display is busy from user interaction)
-            if state_machine.current_page == 3 and display.can_refresh:
-                img = renderer.render_page3_with_state(net_state)
-                display.send(img)
+            log_signature = (
+                net_state.get("wifi_ssid"),
+                net_state.get("lan_ip"),
+                net_state.get("has_default_route"),
+                net_state.get("wifi_device_state"),
+                connectivity,
+                ap_active,
+            )
+            if log_signature != last_logged_signature:
+                print(
+                    "[NetworkLoop] State: "
+                    f"ssid={net_state.get('wifi_ssid') or '-'} "
+                    f"ip={net_state.get('lan_ip') or '-'} "
+                    f"route={net_state.get('has_default_route')} "
+                    f"nm={net_state.get('wifi_device_state')} "
+                    f"internet={connectivity} ap={ap_active}"
+                )
+                last_logged_signature = log_signature
 
-        # If Page 3 is active, refresh periodically to show current state
-        # (for when AP is still starting or user just connected to Wi-Fi)
-        # Skip if display is currently busy (user may be turning pages)
-        if state_machine.current_page == 3 and display.can_refresh:
-            img = renderer.render_page3_with_state(net_state)
-            display.send(img)
+            if station_healthy:
+                link_unhealthy_since = None
+                if stable_since is None:
+                    stable_since = now
+            else:
+                stable_since = None
+                if link_unhealthy_since is None:
+                    link_unhealthy_since = now
 
-        await asyncio.sleep(15)
+            # WSS is the user-visible cloud path. Cached NetworkManager
+            # connectivity must not mask a stale lease; after this timer we
+            # force an active connectivity check before touching the radio.
+            if station_healthy and not ws_online:
+                if internet_unhealthy_since is None:
+                    internet_unhealthy_since = now
+            else:
+                internet_unhealthy_since = None
+
+            if (
+                stable_since is not None
+                and now - stable_since >= STABLE_CONNECTION_RESET
+                and reconnect_failures
+            ):
+                print("[NetworkLoop] Station stable; reconnect backoff reset")
+                reconnect_failures = 0
+                next_reconnect_at = 0.0
+
+            link_outage_age = (
+                now - link_unhealthy_since if link_unhealthy_since is not None else 0
+            )
+            internet_outage_age = (
+                now - internet_unhealthy_since
+                if internet_unhealthy_since is not None
+                else 0
+            )
+            ap_grace_complete = (
+                not ap_active
+                or (
+                    ap_active_since is not None
+                    and now - ap_active_since >= AP_STATION_RETRY_CONFIRMATION
+                )
+            )
+            link_recovery_needed = (
+                not station_healthy
+                and link_outage_age >= LINK_FAILURE_CONFIRMATION
+                and ap_grace_complete
+            )
+            internet_recovery_needed = (
+                station_healthy
+                and internet_outage_age >= INTERNET_FAILURE_CONFIRMATION
+            )
+
+            if internet_recovery_needed:
+                active_connectivity = await asyncio.to_thread(
+                    network_manager.get_connectivity_state, True
+                )
+                if active_connectivity == "full":
+                    # Wi-Fi and Internet are healthy; leave the radio alone and
+                    # let WSClient continue endpoint-specific retries.
+                    print(
+                        "[NetworkLoop] Active Internet check passed; "
+                        "cloud endpoint remains offline"
+                    )
+                    internet_unhealthy_since = now
+                    internet_recovery_needed = False
+
+            if (
+                networks
+                and (link_recovery_needed or internet_recovery_needed)
+                and now >= next_reconnect_at
+            ):
+                attempt = reconnect_failures + 1
+                aggressive = attempt >= 3 and attempt % 3 == 0
+                reason = "link/DHCP" if link_recovery_needed else "Internet/cloud"
+                print(
+                    f"[NetworkLoop] Recovery attempt {attempt} "
+                    f"for {reason} failure (radio_reset={aggressive})"
+                )
+                recovered = await asyncio.to_thread(
+                    network_manager.ensure_best_wifi,
+                    networks,
+                    aggressive,
+                    internet_recovery_needed,
+                )
+                net_state = await asyncio.to_thread(network_manager.get_network_state)
+                now = time.monotonic()
+                path_recovered = bool(net_state.get("station_healthy"))
+                if internet_recovery_needed and path_recovered:
+                    active_connectivity = await asyncio.to_thread(
+                        network_manager.get_connectivity_state, True
+                    )
+                    if active_connectivity != "full":
+                        print(
+                            "[NetworkLoop] Station reactivated; active Internet "
+                            f"state is {active_connectivity}, allowing cloud grace"
+                        )
+
+                if recovered and path_recovered:
+                    print(
+                        f"[NetworkLoop] Station recovered: "
+                        f"ssid={net_state.get('wifi_ssid')} ip={net_state.get('lan_ip')}"
+                    )
+                    link_unhealthy_since = None
+                    internet_unhealthy_since = None
+                    stable_since = now
+                    ap_active_since = None
+                    next_reconnect_at = now + LINK_FAILURE_CONFIRMATION
+                    ws.request_reconnect()
+                else:
+                    reconnect_failures += 1
+                    delay = _reconnect_delay(reconnect_failures)
+                    next_reconnect_at = now + delay
+                    if net_state.get("ap_active"):
+                        # ensure_best_wifi restored the AP after its bounded
+                        # station probe; start a fresh AP availability window.
+                        ap_active_since = (
+                            net_state.get("ap_activated_at") or now
+                        )
+                        next_reconnect_at = max(
+                            next_reconnect_at,
+                            now + AP_STATION_RETRY_CONFIRMATION,
+                        )
+                    print(
+                        f"[NetworkLoop] Recovery failed; attempt "
+                        f"{reconnect_failures + 1} in {delay:.1f}s"
+                    )
+
+            # AP fallback is deliberately delayed for configured devices. A
+            # short router/DHCP outage should not seize the only radio and
+            # prevent NetworkManager's own station autoconnect.
+            now = time.monotonic()
+            link_outage_age = (
+                now - link_unhealthy_since if link_unhealthy_since is not None else 0
+            )
+            fallback_delay = (
+                CONFIGURED_AP_FALLBACK_DELAY
+                if networks
+                else UNCONFIGURED_AP_FALLBACK_DELAY
+            )
+            if (
+                not station_healthy
+                and link_outage_age >= fallback_delay
+                and not net_state.get("ap_active")
+                and now >= ap_retry_at
+            ):
+                print(
+                    f"[NetworkLoop] Station unavailable for {link_outage_age:.0f}s; "
+                    "starting configuration AP"
+                )
+                ap_started = await asyncio.to_thread(
+                    network_manager.start_ap_if_unavailable
+                )
+                now = time.monotonic()
+                ap_retry_at = now + 60
+                net_state = await asyncio.to_thread(network_manager.get_network_state)
+                if ap_started and net_state.get("ap_active"):
+                    ap_active_since = (
+                        net_state.get("ap_activated_at") or now
+                    )
+                    next_reconnect_at = max(
+                        next_reconnect_at,
+                        now + AP_STATION_RETRY_CONFIRMATION,
+                    )
+            elif station_healthy and net_state.get("ap_active"):
+                print("[NetworkLoop] Healthy station detected; stopping AP")
+                await asyncio.to_thread(
+                    network_manager.stop_ap_if_station_available
+                )
+                net_state = await asyncio.to_thread(network_manager.get_network_state)
+
+            # Redraw Page 3 only when its network information changes. Keep a
+            # pending state until the display becomes available.
+            page3_signature = _page3_signature(net_state)
+            if observed_page3_signature is None:
+                observed_page3_signature = page3_signature
+            elif page3_signature != observed_page3_signature:
+                observed_page3_signature = page3_signature
+                if state_machine.current_page == 3:
+                    pending_page3_state = net_state
+
+            if state_machine.current_page != 3:
+                pending_page3_state = None
+            elif (
+                pending_page3_state is not None
+                and not state_machine.render_in_progress
+                and display.can_refresh
+            ):
+                image = renderer.render_page3_with_state(pending_page3_state)
+                if display.send(
+                    image, page=3, online=ws.is_online()
+                ):
+                    pending_page3_state = None
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[NetworkLoop] Unexpected error: {type(exc).__name__}: {exc}")
+
+        await asyncio.sleep(NETWORK_POLL_INTERVAL)
 
 
 async def shutdown(signal_name):
+    global g_shutting_down
+    if g_shutting_down:
+        return
+    g_shutting_down = True
     print(f"\n[Main] Received {signal_name}, shutting down...")
     if g_ws_client:
         g_ws_client.stop()
-    for t in g_tasks:
-        t.cancel()
-    await asyncio.gather(*g_tasks, return_exceptions=True)
-    g_loop.stop()
+    if g_network_manager:
+        g_network_manager.cancel_pending_operations()
+    if g_web_server:
+        g_web_server.shutdown()
+    current = asyncio.current_task()
+    pending = [task for task in g_tasks if task is not current]
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _signal_handler(signum):
@@ -310,73 +506,93 @@ def _signal_handler(signum):
 
 
 async def main():
-    global g_loop, g_tasks, g_ws_client
+    global g_loop, g_tasks, g_ws_client, g_web_server, g_network_manager
     g_loop = asyncio.get_running_loop()
-
     for sig in (signal.SIGINT, signal.SIGTERM):
-        g_loop.add_signal_handler(sig, lambda s=sig: _signal_handler(s))
+        g_loop.add_signal_handler(sig, lambda selected=sig: _signal_handler(selected))
 
-    # ------------------------------------------------------------------
-    # Init modules
-    # ------------------------------------------------------------------
     config = Config(CONFIG_PATH)
     state = StateMachine()
     display = DisplayClient("/tmp/pinepi.sock")
     renderer = Renderer(config)
-    nm = NetworkManager(config)
+    network_manager = NetworkManager(config)
     ws = WSClient(config, display, state, renderer)
+    web = WebServer(config, network_manager, port=8080)
     g_ws_client = ws
+    g_web_server = web
+    g_network_manager = network_manager
     renderer.ws_client = ws
-    web = WebServer(config, nm, port=8080)
 
-    # ------------------------------------------------------------------
-    # Pre-launch: kill stale display, then start fresh
-    # ------------------------------------------------------------------
     _kill_old_display()
     display_proc = start_display_process()
-
-    # C process binds UDS immediately on startup, just wait for process creation
     print("[Main] Waiting 1s for display process to start...")
     await asyncio.sleep(1)
+    if g_shutting_down:
+        display.close()
+        return
 
-    # ------------------------------------------------------------------
-    # Start WebSocket early so the first frame can reflect the real status
-    # ------------------------------------------------------------------
     ws_task = asyncio.create_task(ws.run())
     try:
-        # Give the WebSocket a short moment to connect before painting the first frame
         await asyncio.wait_for(ws.connected.wait(), timeout=2)
     except asyncio.TimeoutError:
         pass
+    if g_shutting_down:
+        ws.stop()
+        ws_task.cancel()
+        await asyncio.gather(ws_task, return_exceptions=True)
+        display.close()
+        return
 
-    # ------------------------------------------------------------------
-    # Send initial Page 1 (blank or cached cloud image)
-    # ------------------------------------------------------------------
-    # Show default page on first startup to indicate system is ready
-    img = renderer.render_page1()
-    print(f"[Main] Initial image size: {len(img)} bytes")
-    ok = display.send(img)
-    print(f"[Main] Initial send result: {ok}")
+    image = renderer.render_page1(is_offline=not ws.is_online())
+    print(f"[Main] Initial image size: {len(image)} bytes")
+    print(
+        f"[Main] Initial send result: "
+        f"{display.send(image, page=1, online=ws.is_online())}"
+    )
 
-    # ------------------------------------------------------------------
-    # Start all background tasks
-    # ------------------------------------------------------------------
     restart_event = asyncio.Event()
     asyncio.create_task(monitor_display(display_proc, restart_event))
     asyncio.create_task(display_watchdog(restart_event, start_display_process))
 
-    touch = TouchListener("/tmp/pinepi-touch.sock", state, display, renderer, ws, nm)
-
+    touch = TouchListener(
+        "/tmp/pinepi-touch.sock",
+        state,
+        display,
+        renderer,
+        ws,
+        network_manager,
+    )
     g_tasks = [
         ws_task,
         asyncio.create_task(touch.run()),
-        asyncio.create_task(network_loop(config, nm, state, display, renderer, ws)),
+        asyncio.create_task(
+            network_loop(
+                config,
+                network_manager,
+                state,
+                display,
+                renderer,
+                ws,
+            )
+        ),
+        asyncio.create_task(
+            status_display_loop(
+                state, display, renderer, ws, network_manager
+            )
+        ),
         asyncio.create_task(asyncio.to_thread(web.run)),
-        asyncio.create_task(keep_alive_loop(state, display, renderer, ws, nm)),
+        asyncio.create_task(
+            daily_refresh_loop(state, display, renderer, ws, network_manager)
+        ),
     ]
 
     print("[Main] pinepi-core started. Press Ctrl+C to exit.")
-    await asyncio.gather(*g_tasks)
+    try:
+        await asyncio.gather(*g_tasks)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        display.close()
 
 
 if __name__ == "__main__":
